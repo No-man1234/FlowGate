@@ -1,4 +1,4 @@
-.PHONY: all build test clean run-upstream run-gateway benchmark
+.PHONY: all build test bench clean run-upstream run-gateway benchmark
 
 BINARY_DIR=bin
 GO=go
@@ -16,11 +16,15 @@ test:
 	@echo "Running unit tests with race detector..."
 	$(GO) test -v -race -cover ./...
 
+bench:
+	@echo "Running performance microbenchmarks..."
+	$(GO) test -bench=. -benchmem ./pkg/...
+
 run-upstream:
 	$(GO) run ./cmd/upstream -port 9090 -latency 15 -capacity 50
 
 run-gateway:
-	$(GO) run ./cmd/flowgate -port 8080 -upstream http://127.0.0.1:9090 -initial-limit 50
+	$(GO) run ./cmd/flowgate -port 8080 -upstream http://127.0.0.1:9090 -initial-limit 50 -trust-priority=true
 
 benchmark:
 	$(GO) run ./cmd/loadgen -url http://127.0.0.1:8080/work -concurrency 500 -duration 10s

@@ -18,6 +18,7 @@ import (
 type GatewayConfig struct {
 	UpstreamURL         *url.URL
 	PriorityHeader      string        // e.g. "X-Priority"
+	TrustClientPriority bool          // If false, untrusted client-supplied priority headers are ignored (default: false)
 	ClientTimeout       time.Duration // Max time client request is allowed to wait
 	RetryAfterSeconds   int           // Retry-After header value on shed (default: 1)
 	MaxIdleConns        int           // Pool capacity (default: 20000)
@@ -110,8 +111,11 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 2: Adaptive Concurrency Check (Load Shedding / Backpressure)
-	priorityVal := r.Header.Get(rg.cfg.PriorityHeader)
-	priority := limiter.ParsePriority(priorityVal)
+	priority := limiter.PriorityStandard
+	if rg.cfg.TrustClientPriority {
+		priorityVal := r.Header.Get(rg.cfg.PriorityHeader)
+		priority = limiter.ParsePriority(priorityVal)
+	}
 
 	token, ok := rg.limiter.Acquire(r.Context(), priority)
 	if !ok {

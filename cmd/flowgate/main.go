@@ -21,6 +21,7 @@ func main() {
 	initialLimit := flag.Float64("initial-limit", 50, "Initial dynamic concurrency limit")
 	minLimit := flag.Float64("min-limit", 5, "Minimum concurrency limit floor")
 	maxLimit := flag.Float64("max-limit", 10000, "Maximum concurrency ceiling")
+	trustPriority := flag.Bool("trust-priority", false, "Trust client-supplied X-Priority headers (default: false, assigns standard)")
 	showDashboard := flag.Bool("dashboard", true, "Render live ASCII status dashboard in terminal")
 	flag.Parse()
 
@@ -42,7 +43,8 @@ func main() {
 
 	gateway := proxy.NewGateway(
 		proxy.GatewayConfig{
-			UpstreamURL: upstreamURL,
+			UpstreamURL:         upstreamURL,
+			TrustClientPriority: *trustPriority,
 		},
 		adaptLimiter,
 		circuitBreaker,

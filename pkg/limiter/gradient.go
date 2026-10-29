@@ -14,9 +14,9 @@ type GradientConfig struct {
 	MinLimit     float64       // Lower bound for concurrency limit (default: 5)
 	MaxLimit     float64       // Upper bound for concurrency limit (default: 10000)
 	Smoothing    float64       // EWMA smoothing factor alpha for sampleRTT (0.0 to 1.0, default: 0.2)
-	Tolerance    float64       // Tolerance factor for gradient before throttling (default: 1.05)
-	BackoffRatio float64       // Multiplicative reduction upon severe timeout/error (default: 0.75)
-	MinRTTWindow time.Duration // Window to refresh minRTT baseline (default: 30s)
+	Tolerance    float64       // Tolerance factor for gradient before throttling (default: 1.25, allows 25% jitter)
+	BackoffRatio float64       // Multiplicative reduction upon severe timeout/5xx (default: 0.75)
+	MinRTTWindow time.Duration // Window to refresh minRTT baseline to adapt to infra shifts (default: 30s)
 
 	// Thresholds for priority tiers (percentage of current limit)
 	StandardThreshold   float64 // default: 0.85 (sheds standard when in-flight >= 85% limit)
@@ -30,7 +30,7 @@ func DefaultConfig() GradientConfig {
 		MinLimit:            5,
 		MaxLimit:            10000,
 		Smoothing:           0.2,
-		Tolerance:           1.05,
+		Tolerance:           1.25,
 		BackoffRatio:        0.75,
 		MinRTTWindow:        30 * time.Second,
 		StandardThreshold:   0.85,
@@ -38,7 +38,7 @@ func DefaultConfig() GradientConfig {
 	}
 }
 
-// GradientLimiter is an adaptive concurrency limiter based on the Gradient / TCP Vegas algorithm.
+// GradientLimiter is an adaptive concurrency limiter based on Netflix's Gradient2 algorithm.
 // It dynamically tracks RTT drift to detect queuing and prevent upstream collapse.
 type GradientLimiter struct {
 	cfg GradientConfig
@@ -52,11 +52,12 @@ type GradientLimiter struct {
 	shedBest     atomic.Uint64
 
 	// Concurrency state protected by mu
-	mu           sync.RWMutex
-	currentLimit float64
-	minRTT       time.Duration
-	sampleRTT    time.Duration
-	minRTTReset  time.Time
+	mu              sync.RWMutex
+	currentLimit    float64
+	minRTT          time.Duration
+	sampleRTT       time.Duration
+	candidateMinRTT time.Duration
+	windowStart     time.Time
 }
 
 // NewGradientLimiter creates a configured GradientLimiter.
@@ -74,7 +75,7 @@ func NewGradientLimiter(cfg GradientConfig) *GradientLimiter {
 		cfg.Smoothing = 0.2
 	}
 	if cfg.Tolerance <= 0 {
-		cfg.Tolerance = 1.05
+		cfg.Tolerance = 1.25
 	}
 	if cfg.BackoffRatio <= 0 || cfg.BackoffRatio >= 1.0 {
 		cfg.BackoffRatio = 0.75
@@ -92,7 +93,7 @@ func NewGradientLimiter(cfg GradientConfig) *GradientLimiter {
 	return &GradientLimiter{
 		cfg:          cfg,
 		currentLimit: cfg.InitialLimit,
-		minRTTReset:  time.Now(),
+		windowStart:  time.Now(),
 	}
 }
 
@@ -159,10 +160,20 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 
 	now := time.Now()
 
-	// Periodically refresh minRTT to adapt to permanent infrastructure shifts
-	if now.Sub(g.minRTTReset) > g.cfg.MinRTTWindow || g.minRTT == 0 {
-		g.minRTT = rtt
-		g.minRTTReset = now
+	// Windowed minRTT tracking with candidate window:
+	// Avoids setting minRTT to an anomalous spike if the reset happens during a brownout.
+	if g.candidateMinRTT == 0 || rtt < g.candidateMinRTT {
+		g.candidateMinRTT = rtt
+	}
+
+	if now.Sub(g.windowStart) >= g.cfg.MinRTTWindow || g.minRTT == 0 {
+		if g.candidateMinRTT > 0 {
+			g.minRTT = g.candidateMinRTT
+		} else {
+			g.minRTT = rtt
+		}
+		g.candidateMinRTT = rtt
+		g.windowStart = now
 	} else if rtt < g.minRTT {
 		g.minRTT = rtt
 	}
@@ -181,19 +192,21 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 		return
 	}
 
-	// Calculate gradient: G = minRTT / sampleRTT
-	if g.sampleRTT <= 0 {
+	// Netflix Gradient2 algorithm:
+	// rawGradient = (minRTT / sampleRTT) * tolerance
+	// gradient = clamp(rawGradient, 0.5, 1.0)
+	if g.sampleRTT <= 0 || g.minRTT <= 0 {
 		return
 	}
 
-	gradient := float64(g.minRTT) / float64(g.sampleRTT)
-	gradient = math.Min(g.cfg.Tolerance, gradient)
+	rawGradient := (float64(g.minRTT) / float64(g.sampleRTT)) * g.cfg.Tolerance
+	gradient := math.Max(0.5, math.Min(1.0, rawGradient))
 
-	// Little's Law headroom probe factor: beta = sqrt(currentLimit)
-	beta := math.Sqrt(g.currentLimit)
+	// Queue headroom probe factor: beta = sqrt(currentLimit)
+	queueSize := math.Sqrt(g.currentLimit)
 
-	// New Limit = Current * Gradient + Beta
-	newLimit := g.currentLimit*gradient + beta
+	// New Limit = Current * Gradient + QueueSize
+	newLimit := g.currentLimit*gradient + queueSize
 
 	// Bound between MinLimit and MaxLimit
 	newLimit = math.Max(g.cfg.MinLimit, math.Min(g.cfg.MaxLimit, newLimit))
