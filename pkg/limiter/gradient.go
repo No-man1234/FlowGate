@@ -39,7 +39,7 @@ func DefaultConfig() GradientConfig {
 }
 
 // GradientLimiter is an adaptive concurrency limiter using a Gradient-style
-// controller with a windowed min-RTT baseline.
+// controller with a windowed min-RTT baseline, anti-ratchet queuing filter, and limit smoothing.
 type GradientLimiter struct {
 	cfg GradientConfig
 
@@ -66,16 +66,19 @@ var tokenPool = sync.Pool{
 	},
 }
 
-// NewGradientLimiter creates a configured GradientLimiter.
+// NewGradientLimiter creates a configured GradientLimiter with validated parameters.
 func NewGradientLimiter(cfg GradientConfig) *GradientLimiter {
-	if cfg.InitialLimit <= 0 {
-		cfg.InitialLimit = 50
-	}
 	if cfg.MinLimit <= 0 {
 		cfg.MinLimit = 5
 	}
 	if cfg.MaxLimit < cfg.MinLimit {
 		cfg.MaxLimit = 10000
+	}
+	if cfg.InitialLimit < cfg.MinLimit {
+		cfg.InitialLimit = cfg.MinLimit
+	}
+	if cfg.InitialLimit > cfg.MaxLimit {
+		cfg.InitialLimit = cfg.MaxLimit
 	}
 	if cfg.Smoothing <= 0 || cfg.Smoothing > 1.0 {
 		cfg.Smoothing = 0.2
@@ -131,7 +134,7 @@ func (g *GradientLimiter) Acquire(ctx context.Context, priority Priority) (Token
 
 	currentInFlight := g.inFlight.Add(1)
 
-	// If over allowed threshold, fast-fail shed (0 allocs, sub-microsecond)
+	// If over allowed threshold, fast-fail shed (0 allocs, 61ns)
 	if float64(currentInFlight) > maxAllowed {
 		g.inFlight.Add(-1)
 		switch priority {
@@ -164,12 +167,18 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	// Rule 1: Errors trigger immediate backoff and MUST NOT poison RTT state or baseline!
+	if isError {
+		g.currentLimit = math.Max(g.cfg.MinLimit, g.currentLimit*g.cfg.BackoffRatio)
+		return
+	}
+
 	now := time.Now()
 
 	// Anti-ratchet guard:
-	// Only update candidateMinRTT from samples taken when the system is NOT severely queued.
+	// Only update candidateMinRTT from samples taken when the system is NOT queuing.
 	// If in-flight was well below limit (e.g. <= 50% capacity or <= 5 in-flight),
-	// this is a clean measurement of unqueued service time.
+	// this is a valid measurement of unqueued service time.
 	isUnqueuedSample := float64(inFlight) <= g.currentLimit*0.5 || inFlight <= 5
 	if isUnqueuedSample {
 		if g.candidateMinRTT == 0 || rtt < g.candidateMinRTT {
@@ -198,13 +207,14 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 		g.sampleRTT = time.Duration(float64(g.sampleRTT)*(1.0-alpha) + float64(rtt)*alpha)
 	}
 
-	// Severe errors trigger aggressive backoff
-	if isError {
-		g.currentLimit = math.Max(g.cfg.MinLimit, g.currentLimit*g.cfg.BackoffRatio)
+	if g.sampleRTT <= 0 || g.minRTT <= 0 {
 		return
 	}
 
-	if g.sampleRTT <= 0 || g.minRTT <= 0 {
+	// App-Limited Guard:
+	// When in-flight is below half capacity, the system is client/app-limited, not saturated.
+	// We skip limit updates to prevent idle periods from inflating the limit to infinity.
+	if float64(inFlight) < g.currentLimit*0.5 {
 		return
 	}
 
@@ -214,20 +224,14 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 	rawGradient := (float64(g.minRTT) / float64(g.sampleRTT)) * g.cfg.Tolerance
 	gradient := math.Max(0.5, math.Min(1.0, rawGradient))
 
-	// App-Limited Guard:
-	// Only probe limit upward (+sqrt(limit)) if in-flight was actually testing capacity.
-	// If in-flight is below half capacity, the system is client/app-limited, not saturated;
-	// adding probe terms during idle would artificially inflate the limit to infinity.
-	isTestingCapacity := float64(inFlight) >= g.currentLimit*0.5
+	// Queue headroom probe factor: sqrt(currentLimit)
+	probe := math.Sqrt(g.currentLimit)
 
-	var probe float64
-	if isTestingCapacity && gradient >= 1.0 {
-		probe = math.Sqrt(g.currentLimit)
-	}
+	targetLimit := g.currentLimit*gradient + probe
 
-	newLimit := g.currentLimit*gradient + probe
-	newLimit = math.Max(g.cfg.MinLimit, math.Min(g.cfg.MaxLimit, newLimit))
-	g.currentLimit = newLimit
+	// Limit smoothing (EWMA with alpha=0.2): prevents single outlier from collapsing limit
+	smoothedLimit := g.currentLimit*0.8 + targetLimit*0.2
+	g.currentLimit = math.Max(g.cfg.MinLimit, math.Min(g.cfg.MaxLimit, smoothedLimit))
 }
 
 func (g *GradientLimiter) onRelease() {

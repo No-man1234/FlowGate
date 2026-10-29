@@ -1,13 +1,16 @@
 package proxy
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/No-man1234/FlowGate/pkg/breaker"
@@ -24,7 +27,7 @@ type GatewayConfig struct {
 	PriorityHeader      string         // e.g. "X-Priority"
 	TrustClientPriority bool           // If true, client-supplied priority headers are respected (default: false)
 	Classifier          ClassifierFunc // Custom server-side request priority classifier
-	ClientTimeout       time.Duration  // Max time client request is allowed to wait
+	ClientTimeout       time.Duration  // Max time client request is allowed to wait (default: 30s)
 	RetryAfterSeconds   int            // Retry-After header value on shed (default: 1)
 	MaxIdleConns        int            // Pool capacity (default: 20000)
 	MaxIdleConnsPerHost int            // Pool per upstream host (default: 10000)
@@ -83,6 +86,9 @@ func NewGateway(
 	if cfg.MaxIdleConnsPerHost <= 0 {
 		cfg.MaxIdleConnsPerHost = 10000
 	}
+	if cfg.ClientTimeout <= 0 {
+		cfg.ClientTimeout = 30 * time.Second
+	}
 
 	classifier := cfg.Classifier
 	if classifier == nil {
@@ -116,15 +122,21 @@ func NewGateway(
 	revProxy := httputil.NewSingleHostReverseProxy(cfg.UpstreamURL)
 	revProxy.Transport = transport
 
-	// Custom error handler to detect upstream connection refusal / timeouts
+	// Custom error handler to detect upstream connection failure without leaking internal addresses
 	revProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		rg.metrics.UpstreamErrors.Add(1)
-		rg.breaker.RecordFailure()
+		if sw, ok := w.(*statusResponseWriter); ok {
+			sw.proxyErr = err
+		}
+
+		statusCode := http.StatusBadGateway
+		if errors.Is(err, context.DeadlineExceeded) {
+			statusCode = http.StatusGatewayTimeout
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", strconv.Itoa(cfg.RetryAfterSeconds))
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = fmt.Fprintf(w, `{"error":"upstream unavailable","detail":"%s"}`+"\n", err.Error())
+		w.WriteHeader(statusCode)
+		_, _ = w.Write([]byte(`{"error":"upstream unavailable"}` + "\n"))
 	}
 
 	rg.proxy = revProxy
@@ -136,7 +148,8 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rg.metrics.TotalRequests.Add(1)
 
 	// Step 1: Circuit Breaker Check (Fast-fail if upstream is down)
-	if !rg.breaker.Allow() {
+	allowed, gen := rg.breaker.Allow()
+	if !allowed {
 		rg.metrics.BreakerTrips.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", strconv.Itoa(rg.cfg.RetryAfterSeconds*3))
@@ -156,7 +169,9 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Step 3: Adaptive Concurrency Check (Load Shedding / Backpressure)
 	token, ok := rg.limiter.Acquire(r.Context(), priority)
 	if !ok {
-		// Fast-fail rejection: Does NOT touch upstream, does NOT trip breaker
+		// Cancel breaker probe slot so half-open state is never locked out!
+		rg.breaker.Cancel(gen)
+
 		rg.metrics.ShedRequests.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", strconv.Itoa(rg.cfg.RetryAfterSeconds))
@@ -167,33 +182,87 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rg.metrics.AcceptedRequests.Add(1)
 
-	// Step 4: Forward to Upstream with latency timing
+	// Step 4: Forward to Upstream with Time To First Byte (TTFB) latency tracking
 	start := time.Now()
-	wrappedWriter := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	var ttfb atomic.Int64
 
-	rg.proxy.ServeHTTP(wrappedWriter, r)
+	trace := &httptrace.ClientTrace{
+		GotFirstResponseByte: func() {
+			ttfb.Store(int64(time.Since(start)))
+		},
+	}
+	ctxWithTrace := httptrace.WithClientTrace(r.Context(), trace)
 
-	rtt := time.Since(start)
-	isServerErr := wrappedWriter.statusCode >= 500
-
-	if isServerErr {
-		rg.metrics.UpstreamErrors.Add(1)
-		rg.breaker.RecordFailure()
-	} else {
-		rg.breaker.RecordSuccess()
+	wrappedWriter := &statusResponseWriter{
+		ResponseWriter: w,
+		statusCode:     http.StatusOK,
 	}
 
-	// Step 5: Feedback loop to Adaptive Limiter
-	token.Done(rtt, isServerErr)
+	// Strip incoming priority header before proxying upstream to avoid internal confusion
+	rOut := r.Clone(ctxWithTrace)
+	rOut.Header.Del(rg.cfg.PriorityHeader)
+
+	rg.proxy.ServeHTTP(wrappedWriter, rOut)
+
+	// Determine latency for feedback
+	var rtt time.Duration
+	if measuredTTFB := ttfb.Load(); measuredTTFB > 0 {
+		rtt = time.Duration(measuredTTFB)
+	} else {
+		rtt = time.Since(start)
+	}
+
+	// Step 5: Handle Results and Segregate Client Aborts from Upstream Failures
+	isClientCancel := r.Context().Err() != nil || errors.Is(wrappedWriter.proxyErr, context.Canceled)
+
+	switch {
+	case isClientCancel:
+		// Client aborted or timed out early:
+		// MUST NOT count as an upstream failure! Cancel breaker probe and release token.
+		rg.breaker.Cancel(gen)
+		token.Release()
+
+	case wrappedWriter.proxyErr != nil || wrappedWriter.statusCode >= 500:
+		// Upstream transport error or 5xx: record failure exactly once!
+		rg.metrics.UpstreamErrors.Add(1)
+		rg.breaker.RecordFailure(gen)
+		token.Done(rtt, true)
+
+	default:
+		// Healthy interaction:
+		rg.breaker.RecordSuccess(gen)
+
+		// If streaming (SSE text/event-stream or WebSocket 101 Switching Protocols),
+		// release token without poisoning the latency feedback loop with stream duration!
+		if isStreamingResponse(wrappedWriter.Header().Get("Content-Type"), wrappedWriter.statusCode) {
+			token.Release()
+		} else {
+			token.Done(rtt, false)
+		}
+	}
 }
 
-// statusResponseWriter captures the HTTP status code written to the client.
+func isStreamingResponse(contentType string, code int) bool {
+	if code == http.StatusSwitchingProtocols {
+		return true
+	}
+	return strings.HasPrefix(contentType, "text/event-stream")
+}
+
+// statusResponseWriter captures status code and error, and unwraps the underlying writer
+// so http.ResponseController, http.Flusher, and http.Hijacker work seamlessly.
 type statusResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
+	proxyErr   error
 }
 
 func (w *statusResponseWriter) WriteHeader(code int) {
 	w.statusCode = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap exposes the underlying ResponseWriter for Go's ResponseController, Flusher, and Hijacker.
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

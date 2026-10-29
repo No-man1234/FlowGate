@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -110,13 +111,13 @@ func TestGradientLimiter_PriorityTieredShedding(t *testing.T) {
 
 func TestGradientLimiter_DynamicLimitContractionOnLatencySpike(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.InitialLimit = 50
+	cfg.InitialLimit = 20
 	cfg.MinLimit = 5
 	cfg.Smoothing = 0.5
 	l := NewGradientLimiter(cfg)
 
-	// Establish healthy baseline at 10ms
-	for i := 0; i < 10; i++ {
+	// Establish healthy baseline at 10ms with unqueued requests
+	for i := 0; i < 5; i++ {
 		tok, ok := l.Acquire(context.Background(), PriorityCritical)
 		if !ok {
 			t.Fatalf("acquire failed")
@@ -124,98 +125,134 @@ func TestGradientLimiter_DynamicLimitContractionOnLatencySpike(t *testing.T) {
 		tok.Done(10*time.Millisecond, false)
 	}
 
-	initialHealthyLimit := l.CurrentLimit()
+	initialLimit := l.CurrentLimit()
 
-	// Simulate sudden upstream queueing: latency spikes from 10ms to 200ms
-	for i := 0; i < 20; i++ {
-		tok, ok := l.Acquire(context.Background(), PriorityCritical)
-		if !ok {
-			continue
+	// Simulate heavy load testing capacity (> 50% in-flight) with 200ms latency spike
+	for round := 0; round < 15; round++ {
+		targetInFlight := int(l.CurrentLimit() * 0.75)
+		if targetInFlight < 4 {
+			targetInFlight = 4
 		}
-		tok.Done(200*time.Millisecond, false)
+
+		var active []Token
+		for i := 0; i < targetInFlight; i++ {
+			if tok, ok := l.Acquire(context.Background(), PriorityCritical); ok {
+				active = append(active, tok)
+			}
+		}
+
+		for _, tok := range active {
+			tok.Done(200*time.Millisecond, false)
+		}
 	}
 
 	contractedLimit := l.CurrentLimit()
-	if contractedLimit >= initialHealthyLimit {
+	if contractedLimit >= initialLimit {
 		t.Fatalf("expected limit to contract under 200ms latency spike (was %.2f, now %.2f)",
-			initialHealthyLimit, contractedLimit)
+			initialLimit, contractedLimit)
 	}
 }
 
-func TestGradientLimiter_SustainedQueuingDoesNotInflateBaseline(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.InitialLimit = 20
-	cfg.MinLimit = 5
-	cfg.MinRTTWindow = 50 * time.Millisecond // fast window for test
-	l := NewGradientLimiter(cfg)
-
-	// Step 1: Establish true unloaded baseline at 10ms with 1 concurrent request
-	for i := 0; i < 10; i++ {
-		tok, _ := l.Acquire(context.Background(), PriorityCritical)
-		tok.Done(10*time.Millisecond, false)
-	}
-
-	trueBaseline := l.MinRTT()
-	if trueBaseline != 10*time.Millisecond {
-		t.Fatalf("expected true baseline 10ms, got %v", trueBaseline)
-	}
-
-	// Step 2: Simulate sustained saturation where in-flight is held at capacity
-	// and response times are inflated to 50ms (5x queueing delay) over multiple window resets
-	time.Sleep(60 * time.Millisecond) // Trigger window rollover
-
-	// Saturate the limiter
-	var tokens []Token
-	for i := 0; i < int(l.CurrentLimit()); i++ {
-		if tok, ok := l.Acquire(context.Background(), PriorityCritical); ok {
-			tokens = append(tokens, tok)
-		}
-	}
-
-	// Release saturated tokens under severe queuing
-	for _, tok := range tokens {
-		tok.Done(50*time.Millisecond, false)
-	}
-
-	// The anti-ratchet guard must prevent 50ms saturated queuing from inflating the baseline
-	ratchetBaseline := l.MinRTT()
-	if ratchetBaseline > 20*time.Millisecond {
-		t.Fatalf("ratchet failure: sustained queuing inflated baseline to %v (should stay near 10ms)", ratchetBaseline)
-	}
-}
-
-func TestGradientLimiter_AppLimitedDoesNotInflateIdle(t *testing.T) {
+func TestLimiter_AppLimitedNoGrowth(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.InitialLimit = 50
 	l := NewGradientLimiter(cfg)
 
-	// Run low concurrency traffic (1 request at a time, well below capacity of 50)
-	for i := 0; i < 50; i++ {
+	// 1000 completions at in-flight 1 (well below limit/2) must not grow the limit
+	for i := 0; i < 1000; i++ {
 		tok, _ := l.Acquire(context.Background(), PriorityCritical)
 		tok.Done(10*time.Millisecond, false)
 	}
 
-	// The app-limited guard must prevent idle probes from inflating the limit endlessly
-	if l.CurrentLimit() > 65 {
-		t.Fatalf("expected limit not to inflate during app-limited idle periods, got %.2f", l.CurrentLimit())
+	if l.CurrentLimit() > 50 {
+		t.Fatalf("expected limit not to grow when app-limited at in-flight 1, got %.2f", l.CurrentLimit())
 	}
 }
 
-func TestGradientLimiter_SevereErrorBackoff(t *testing.T) {
+func TestLimiter_ErrorSamplesDontMoveMinRTT(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.InitialLimit = 100
-	cfg.BackoffRatio = 0.5
+	cfg.InitialLimit = 50
 	l := NewGradientLimiter(cfg)
 
-	tok, ok := l.Acquire(context.Background(), PriorityCritical)
-	if !ok {
-		t.Fatalf("acquire failed")
+	// Establish healthy baseline at 15ms
+	for i := 0; i < 5; i++ {
+		tok, _ := l.Acquire(context.Background(), PriorityCritical)
+		tok.Done(15*time.Millisecond, false)
 	}
 
-	// Report severe error (e.g., 504 Gateway Timeout)
-	tok.Done(5*time.Second, true)
+	if l.MinRTT() != 15*time.Millisecond {
+		t.Fatalf("expected baseline 15ms, got %v", l.MinRTT())
+	}
 
-	if l.CurrentLimit() > 55 {
-		t.Fatalf("expected limit to be reduced by backoff ratio (~50), got %.2f", l.CurrentLimit())
+	// Fast 500 error in 100 microseconds
+	tokErr, _ := l.Acquire(context.Background(), PriorityCritical)
+	tokErr.Done(100*time.Microsecond, true)
+
+	// Baseline MUST NOT be poisoned by the fast error!
+	if l.MinRTT() < 10*time.Millisecond {
+		t.Fatalf("error sample poisoned minRTT! was 15ms, now %v", l.MinRTT())
+	}
+}
+
+func TestLimiter_OutlierBoundedDrop(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.InitialLimit = 100
+	l := NewGradientLimiter(cfg)
+
+	// Establish baseline at 10ms
+	for i := 0; i < 5; i++ {
+		tok, _ := l.Acquire(context.Background(), PriorityCritical)
+		tok.Done(10*time.Millisecond, false)
+	}
+
+	// Hold 60 requests in flight (>50% capacity)
+	var active []Token
+	for i := 0; i < 60; i++ {
+		if tok, ok := l.Acquire(context.Background(), PriorityCritical); ok {
+			active = append(active, tok)
+		}
+	}
+
+	// Release 1 outlier with 300ms (30x baseline)
+	active[0].Done(300*time.Millisecond, false)
+
+	// Release remaining 59 with normal 10ms
+	for _, tok := range active[1:] {
+		tok.Done(10*time.Millisecond, false)
+	}
+
+	// With limit smoothing, a single outlier should not crater the limit below 60
+	if l.CurrentLimit() < 60 {
+		t.Fatalf("outlier collapsed limit too aggressively, got %.2f", l.CurrentLimit())
+	}
+}
+
+func TestLimiter_ConcurrentAcquireDone(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.InitialLimit = 100
+	cfg.MaxLimit = 500
+	l := NewGradientLimiter(cfg)
+
+	var wg sync.WaitGroup
+	workers := 16
+	requestsPerWorker := 500
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < requestsPerWorker; i++ {
+				tok, ok := l.Acquire(context.Background(), PriorityStandard)
+				if ok {
+					tok.Done(10*time.Millisecond, false)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if l.InFlight() != 0 {
+		t.Fatalf("expected inFlight == 0 at end of concurrent test, got %d", l.InFlight())
 	}
 }

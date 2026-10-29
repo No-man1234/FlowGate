@@ -1,3 +1,3 @@
 module github.com/No-man1234/FlowGate
 
-go 1.27.0
+go 1.23.0

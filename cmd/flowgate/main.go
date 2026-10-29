@@ -63,7 +63,8 @@ func main() {
 			Shed:            collector.ShedRequests.Load(),
 			BreakerTrips:    collector.BreakerTrips.Load(),
 			UpstreamErrors:  collector.UpstreamErrors.Load(),
-			RequestsPerSec:  0, // snapshot
+			RequestsPerSec:  collector.CurrentRPS(),
+			ShedPerSec:      collector.CurrentShedRPS(),
 			InFlight:        snap.InFlight,
 			Limit:           snap.Limit,
 			MinRTTMs:        float64(snap.MinRTT) / float64(time.Millisecond),
@@ -97,6 +98,8 @@ func main() {
 					Shed:           collector.ShedRequests.Load(),
 					BreakerTrips:   collector.BreakerTrips.Load(),
 					UpstreamErrors: collector.UpstreamErrors.Load(),
+					RequestsPerSec: collector.CurrentRPS(),
+					ShedPerSec:     collector.CurrentShedRPS(),
 					InFlight:       snap.InFlight,
 					Limit:          snap.Limit,
 					MinRTTMs:       float64(snap.MinRTT) / float64(time.Millisecond),

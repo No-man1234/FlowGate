@@ -56,6 +56,7 @@ type CircuitBreaker struct {
 
 	mu               sync.Mutex
 	state            State
+	generation       uint64
 	consecutiveFails int
 	consecutiveSucc  int
 	halfOpenInFlight int
@@ -78,13 +79,15 @@ func New(cfg Config) *CircuitBreaker {
 	}
 
 	return &CircuitBreaker{
-		cfg:   cfg,
-		state: StateClosed,
+		cfg:        cfg,
+		state:      StateClosed,
+		generation: 1,
 	}
 }
 
-// Allow reports whether a request is allowed to proceed to upstream.
-func (cb *CircuitBreaker) Allow() bool {
+// Allow reports whether a request is allowed to proceed to upstream, returning
+// permission and the current state generation.
+func (cb *CircuitBreaker) Allow() (bool, uint64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
@@ -92,34 +95,54 @@ func (cb *CircuitBreaker) Allow() bool {
 
 	switch cb.state {
 	case StateClosed:
-		return true
+		return true, cb.generation
 
 	case StateOpen:
 		// Check if cool-off period has elapsed to transition to half-open
 		if now.Sub(cb.lastTripTime) >= cb.cfg.CoolOff {
 			cb.state = StateHalfOpen
+			cb.generation++
 			cb.halfOpenInFlight = 1
 			cb.consecutiveSucc = 0
-			return true
+			return true, cb.generation
 		}
-		return false
+		return false, cb.generation
 
 	case StateHalfOpen:
 		// Allow up to HalfOpenMaxRequests concurrently
 		if cb.halfOpenInFlight < cb.cfg.HalfOpenMaxRequests {
 			cb.halfOpenInFlight++
-			return true
+			return true, cb.generation
 		}
-		return false
+		return false, cb.generation
 	}
 
-	return true
+	return true, cb.generation
+}
+
+// Cancel releases an allocated probe slot if a request was granted permission
+// via Allow() but was aborted, cancelled, or shed before reaching the upstream.
+func (cb *CircuitBreaker) Cancel(gen uint64) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if gen != cb.generation {
+		return // Straggler from older generation
+	}
+
+	if cb.state == StateHalfOpen && cb.halfOpenInFlight > 0 {
+		cb.halfOpenInFlight--
+	}
 }
 
 // RecordSuccess records a successful upstream interaction.
-func (cb *CircuitBreaker) RecordSuccess() {
+func (cb *CircuitBreaker) RecordSuccess(gen uint64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+
+	if gen != cb.generation {
+		return // Straggler from previous state generation; ignore to prevent premature closure
+	}
 
 	switch cb.state {
 	case StateClosed:
@@ -133,6 +156,7 @@ func (cb *CircuitBreaker) RecordSuccess() {
 		if cb.consecutiveSucc >= cb.cfg.SuccessThreshold {
 			// Successfully verified upstream recovery!
 			cb.state = StateClosed
+			cb.generation++
 			cb.consecutiveFails = 0
 			cb.consecutiveSucc = 0
 			cb.halfOpenInFlight = 0
@@ -141,7 +165,7 @@ func (cb *CircuitBreaker) RecordSuccess() {
 }
 
 // RecordFailure records an upstream failure (e.g. 502 Bad Gateway, 503, connection refused).
-func (cb *CircuitBreaker) RecordFailure() {
+func (cb *CircuitBreaker) RecordFailure(gen uint64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
@@ -151,19 +175,23 @@ func (cb *CircuitBreaker) RecordFailure() {
 		if cb.consecutiveFails >= cb.cfg.FailureThreshold {
 			// Trip the breaker
 			cb.state = StateOpen
+			cb.generation++
 			cb.lastTripTime = time.Now()
 			cb.consecutiveFails = 0
 			cb.consecutiveSucc = 0
+			cb.halfOpenInFlight = 0
 		}
 
 	case StateHalfOpen:
-		// Any failure during probing immediately re-trips the breaker
-		if cb.halfOpenInFlight > 0 {
-			cb.halfOpenInFlight--
+		if gen != cb.generation {
+			return
 		}
+		// Any failure during probing immediately re-trips the breaker
 		cb.state = StateOpen
+		cb.generation++
 		cb.lastTripTime = time.Now()
 		cb.consecutiveSucc = 0
+		cb.halfOpenInFlight = 0
 	}
 }
 

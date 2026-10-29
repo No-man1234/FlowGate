@@ -55,6 +55,16 @@ func (c *Collector) Tick() {
 	c.lastTick = now
 }
 
+// CurrentRPS returns the calculated requests per second across the last tick window.
+func (c *Collector) CurrentRPS() float64 {
+	return c.currentRPS
+}
+
+// CurrentShedRPS returns the calculated shed requests per second across the last tick window.
+func (c *Collector) CurrentShedRPS() float64 {
+	return c.currentShedRPS
+}
+
 // Summary returns an instantaneous snapshot of system metrics.
 type Summary struct {
 	TotalRequests   uint64  `json:"total_requests"`
