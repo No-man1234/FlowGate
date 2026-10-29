@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -38,7 +39,7 @@ func (p Priority) String() string {
 
 // ParsePriority converts a header string into a Priority enum.
 func ParsePriority(s string) Priority {
-	switch s {
+	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "critical", "1", "high":
 		return PriorityCritical
 	case "best-effort", "3", "low", "background":

@@ -109,6 +109,11 @@ func (cb *CircuitBreaker) Allow() (bool, uint64) {
 		return false, cb.generation
 
 	case StateHalfOpen:
+		// If probe window expired (probes died/dropped without reporting), reset halfOpenInFlight to avoid permanent lockout
+		if now.Sub(cb.lastTripTime) >= cb.cfg.CoolOff*2 {
+			cb.halfOpenInFlight = 1
+			return true, cb.generation
+		}
 		// Allow up to HalfOpenMaxRequests concurrently
 		if cb.halfOpenInFlight < cb.cfg.HalfOpenMaxRequests {
 			cb.halfOpenInFlight++

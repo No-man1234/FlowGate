@@ -24,6 +24,7 @@ type Config struct {
 	Handler           http.Handler
 	ReadTimeout       time.Duration
 	ReadHeaderTimeout time.Duration
+	WriteTimeout      time.Duration
 	IdleTimeout       time.Duration
 	DrainTimeout      time.Duration
 }
@@ -35,6 +36,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.ReadHeaderTimeout <= 0 {
 		cfg.ReadHeaderTimeout = 5 * time.Second
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = 30 * time.Second
 	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 60 * time.Second
@@ -50,7 +54,9 @@ func New(cfg Config) *Server {
 			Handler:           cfg.Handler,
 			ReadTimeout:       cfg.ReadTimeout,
 			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+			WriteTimeout:      cfg.WriteTimeout,
 			IdleTimeout:       cfg.IdleTimeout,
+			MaxHeaderBytes:    1 << 20, // 1MB header size ceiling
 		},
 	}
 }
@@ -63,21 +69,31 @@ func (s *Server) ListenAndServeWithGracefulShutdown() error {
 	// Background listener for OS termination signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+
+	stopListener := make(chan struct{})
+	defer close(stopListener)
 
 	go func() {
-		sig := <-sigChan
-		log.Printf("[FlowGate Server] Received signal %v. Initiating graceful shutdown (drain timeout: %v)...", sig, s.drainTime)
+		select {
+		case sig := <-sigChan:
+			log.Printf("[FlowGate Server] Received signal %v. Initiating graceful shutdown (drain timeout: %v)...", sig, s.drainTime)
 
-		ctx, cancel := context.WithTimeout(context.Background(), s.drainTime)
-		defer cancel()
+			ctx, cancel := context.WithTimeout(context.Background(), s.drainTime)
+			defer cancel()
 
-		if err := s.httpServer.Shutdown(ctx); err != nil {
-			shutdownErr <- fmt.Errorf("graceful shutdown failed: %w", err)
+			if err := s.httpServer.Shutdown(ctx); err != nil {
+				_ = s.httpServer.Close() // Force-close remaining hung connections on timeout
+				shutdownErr <- fmt.Errorf("graceful shutdown failed: %w", err)
+				return
+			}
+
+			log.Printf("[FlowGate Server] All active connections drained successfully. Goodbye.")
+			shutdownErr <- nil
+		case <-stopListener:
+			// Server exited before receiving signal (e.g. ListenAndServe failed immediately on bind)
 			return
 		}
-
-		log.Printf("[FlowGate Server] All active connections drained successfully. Goodbye.")
-		shutdownErr <- nil
 	}()
 
 	log.Printf("[FlowGate Server] Listening on %s...", s.httpServer.Addr)

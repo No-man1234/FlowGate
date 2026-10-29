@@ -66,25 +66,25 @@ type GradientLimiter struct {
 
 // NewGradientLimiter creates a configured GradientLimiter with validated parameters.
 func NewGradientLimiter(cfg GradientConfig) *GradientLimiter {
-	if cfg.MinLimit <= 0 {
+	if math.IsNaN(cfg.MinLimit) || math.IsInf(cfg.MinLimit, 0) || cfg.MinLimit <= 0 {
 		cfg.MinLimit = 5
 	}
-	if cfg.MaxLimit < cfg.MinLimit {
+	if math.IsNaN(cfg.MaxLimit) || math.IsInf(cfg.MaxLimit, 0) || cfg.MaxLimit < cfg.MinLimit {
 		cfg.MaxLimit = 10000
 	}
-	if cfg.InitialLimit < cfg.MinLimit {
+	if math.IsNaN(cfg.InitialLimit) || math.IsInf(cfg.InitialLimit, 0) || cfg.InitialLimit < cfg.MinLimit {
 		cfg.InitialLimit = cfg.MinLimit
 	}
 	if cfg.InitialLimit > cfg.MaxLimit {
 		cfg.InitialLimit = cfg.MaxLimit
 	}
-	if cfg.Smoothing <= 0 || cfg.Smoothing > 1.0 {
+	if math.IsNaN(cfg.Smoothing) || math.IsInf(cfg.Smoothing, 0) || cfg.Smoothing <= 0 || cfg.Smoothing > 1.0 {
 		cfg.Smoothing = 0.2
 	}
-	if cfg.Tolerance <= 0 {
+	if math.IsNaN(cfg.Tolerance) || math.IsInf(cfg.Tolerance, 0) || cfg.Tolerance <= 0 {
 		cfg.Tolerance = 1.25
 	}
-	if cfg.BackoffRatio <= 0 || cfg.BackoffRatio >= 1.0 {
+	if math.IsNaN(cfg.BackoffRatio) || math.IsInf(cfg.BackoffRatio, 0) || cfg.BackoffRatio <= 0 || cfg.BackoffRatio >= 1.0 {
 		cfg.BackoffRatio = 0.75
 	}
 	if cfg.MinRTTWindow <= 0 {
@@ -93,10 +93,10 @@ func NewGradientLimiter(cfg GradientConfig) *GradientLimiter {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	if cfg.StandardThreshold <= 0 {
+	if math.IsNaN(cfg.StandardThreshold) || math.IsInf(cfg.StandardThreshold, 0) || cfg.StandardThreshold <= 0 {
 		cfg.StandardThreshold = 0.85
 	}
-	if cfg.BestEffortThreshold <= 0 {
+	if math.IsNaN(cfg.BestEffortThreshold) || math.IsInf(cfg.BestEffortThreshold, 0) || cfg.BestEffortThreshold <= 0 {
 		cfg.BestEffortThreshold = 0.70
 	}
 
@@ -161,17 +161,22 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 	inFlightBefore := g.inFlight.Add(-1)
 	inFlight := inFlightBefore + 1 // in-flight count while request was executing
 
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Rule 1: Errors trigger immediate backoff regardless of RTT duration!
+	if isError {
+		g.currentLimit = math.Max(g.cfg.MinLimit, g.currentLimit*g.cfg.BackoffRatio)
+		return
+	}
+
 	if rtt <= 0 {
 		return
 	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	// Rule 1: Errors trigger immediate backoff and MUST NOT poison RTT state or baseline!
-	if isError {
-		g.currentLimit = math.Max(g.cfg.MinLimit, g.currentLimit*g.cfg.BackoffRatio)
-		return
+	// Bootstrap minRTT on very first valid completion if uninitialized
+	if g.minRTT == 0 {
+		g.minRTT = rtt
 	}
 
 	now := g.cfg.Now()

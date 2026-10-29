@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +20,10 @@ import (
 	"github.com/No-man1234/FlowGate/pkg/limiter"
 	"github.com/No-man1234/FlowGate/pkg/metrics"
 )
+
+type contextKey struct{}
+
+var statusWriterKey = &contextKey{}
 
 // ClassifierFunc inspects an incoming request and determines its priority tier.
 type ClassifierFunc func(r *http.Request) limiter.Priority
@@ -34,6 +40,7 @@ type GatewayConfig struct {
 	RetryAfterSeconds   int            // Retry-After header value on shed (default: 1)
 	MaxIdleConns        int            // Pool capacity (default: 20000)
 	MaxIdleConnsPerHost int            // Pool per upstream host (default: 10000)
+	MaxRequestBodyBytes int64          // Max request body size in bytes (default: 16MB; <0 disables)
 }
 
 // ResilientGateway integrates Adaptive Concurrency Limiting, Circuit Breaking,
@@ -53,26 +60,97 @@ func hasSegmentPrefix(p, prefix string) bool {
 	return p == prefix || strings.HasPrefix(p, prefix+"/")
 }
 
+// stripMatrixParams removes matrix parameters (;param) from each segment in the path.
+func stripMatrixParams(p string) string {
+	if !strings.Contains(p, ";") {
+		return p
+	}
+	segments := strings.Split(p, "/")
+	for i, seg := range segments {
+		if idx := strings.IndexByte(seg, ';'); idx != -1 {
+			segments[i] = seg[:idx]
+		}
+	}
+	return strings.Join(segments, "/")
+}
+
+// normalizePrefixes ensures each prefix has a leading slash and no trailing slash.
+func normalizePrefixes(prefixes []string) []string {
+	norm := make([]string, len(prefixes))
+	for i, pre := range prefixes {
+		pre = strings.TrimSpace(pre)
+		if !strings.HasPrefix(pre, "/") {
+			pre = "/" + pre
+		}
+		pre = strings.TrimSuffix(pre, "/")
+		norm[i] = strings.ToLower(pre)
+	}
+	return norm
+}
+
 // BuildDefaultClassifier creates a path-based classifier using exact segment boundaries.
 func BuildDefaultClassifier(critical, bestEffort []string) ClassifierFunc {
+	normCritical := normalizePrefixes(critical)
+	normBestEffort := normalizePrefixes(bestEffort)
+
 	return func(r *http.Request) limiter.Priority {
-		clean := path.Clean("/" + r.URL.Path)
+		if r == nil || r.URL == nil {
+			return limiter.PriorityStandard
+		}
+		rawPath := r.URL.Path
+		// Decode URL-encoded slashes (%2f / %2F) so encoded paths cannot bypass classification
+		rawPath = strings.ReplaceAll(rawPath, "%2f", "/")
+		rawPath = strings.ReplaceAll(rawPath, "%2F", "/")
+		if r.URL.RawPath != "" {
+			rawDecoded := strings.ReplaceAll(r.URL.RawPath, "%2f", "/")
+			rawDecoded = strings.ReplaceAll(rawDecoded, "%2F", "/")
+			if unesc, err := url.PathUnescape(rawDecoded); err == nil {
+				rawPath = unesc
+			}
+		}
+
+		clean := path.Clean("/" + rawPath)
+		clean = stripMatrixParams(clean)
 		p := strings.ToLower(clean)
 
-		for _, pre := range critical {
-			if hasSegmentPrefix(p, strings.ToLower(pre)) {
+		for _, pre := range normCritical {
+			if hasSegmentPrefix(p, pre) {
 				return limiter.PriorityCritical
 			}
 		}
 
-		for _, pre := range bestEffort {
-			if hasSegmentPrefix(p, strings.ToLower(pre)) {
+		for _, pre := range normBestEffort {
+			if hasSegmentPrefix(p, pre) {
 				return limiter.PriorityBestEffort
 			}
 		}
 
 		return limiter.PriorityStandard
 	}
+}
+
+// syncBufferPool provides pooled 32KB buffers to eliminate GC allocations during reverse proxy streaming.
+type syncBufferPool struct {
+	pool sync.Pool
+}
+
+func newSyncBufferPool() *syncBufferPool {
+	return &syncBufferPool{
+		pool: sync.Pool{
+			New: func() any {
+				b := make([]byte, 32*1024)
+				return &b
+			},
+		},
+	}
+}
+
+func (p *syncBufferPool) Get() []byte {
+	return *(p.pool.Get().(*[]byte))
+}
+
+func (p *syncBufferPool) Put(b []byte) {
+	p.pool.Put(&b)
 }
 
 // NewGateway creates and configures a ResilientGateway.
@@ -96,6 +174,9 @@ func NewGateway(
 	}
 	if cfg.ClientTimeout <= 0 {
 		cfg.ClientTimeout = 15 * time.Second
+	}
+	if cfg.MaxRequestBodyBytes == 0 {
+		cfg.MaxRequestBodyBytes = 16 * 1024 * 1024 // 16 MB default request body protection
 	}
 
 	if len(cfg.CriticalPrefixes) == 0 {
@@ -135,13 +216,40 @@ func NewGateway(
 		classifier: classifier,
 	}
 
-	revProxy := httputil.NewSingleHostReverseProxy(cfg.UpstreamURL)
-	revProxy.Transport = transport
+	// Modern RFC-compliant ReverseProxy using Rewrite (Go 1.20+)
+	// - Automatically rewrites Host header to target upstream host
+	// - Sanitizes client-spoofed X-Forwarded-* headers and sets legitimate client IP
+	// - Properly manages RFC 9110 hop-by-hop headers and WebSocket upgrades
+	revProxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			if cfg.UpstreamURL != nil {
+				pr.SetURL(cfg.UpstreamURL)
+			}
+			pr.SetXForwarded()
+			pr.Out.Header.Del(rg.cfg.PriorityHeader)
+		},
+		Transport:     transport,
+		FlushInterval: -1, // Flush immediately after each write to support SSE & chunked streaming
+		BufferPool:    newSyncBufferPool(),
+	}
+
+	// Capture true upstream response status code (including 101 Switching Protocols)
+	revProxy.ModifyResponse = func(res *http.Response) error {
+		if sw, ok := res.Request.Context().Value(statusWriterKey).(*statusResponseWriter); ok {
+			sw.statusCode = res.StatusCode
+		}
+		return nil
+	}
 
 	// Custom error handler to detect upstream connection failure without leaking internal addresses
 	revProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		if sw, ok := w.(*statusResponseWriter); ok {
 			sw.proxyErr = err
+		}
+
+		// If client canceled or disconnected, do not emit misleading 502/Retry-After to closed socket
+		if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+			return
 		}
 
 		statusCode := http.StatusBadGateway
@@ -161,6 +269,19 @@ func NewGateway(
 
 // ServeHTTP implements http.Handler, executing the resilient protection pipeline.
 func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r == nil || r.URL == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"bad request","message":"request or request URL is nil"}` + "\n"))
+		return
+	}
+	if rg.cfg.UpstreamURL == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"bad gateway","message":"upstream target URL is not configured"}` + "\n"))
+		return
+	}
+
 	rg.metrics.TotalRequests.Add(1)
 
 	// Step 1: Circuit Breaker Check (Fast-fail if upstream is down)
@@ -174,10 +295,26 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Payload Limit Check: Fast-fail Content-Length over limit
+	if rg.cfg.MaxRequestBodyBytes > 0 && r.Body != nil {
+		if r.ContentLength > rg.cfg.MaxRequestBodyBytes {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = w.Write([]byte(`{"error":"payload too large","message":"request entity exceeds configured size limit"}` + "\n"))
+			return
+		}
+	}
+
 	// Step 2: Clean path and Request Priority Classification
 	cleanPath := path.Clean("/" + r.URL.Path)
 	rClean := r.Clone(r.Context())
 	rClean.URL.Path = cleanPath
+	rClean.URL.RawPath = "" // Clear RawPath to prevent path traversal desync in EscapedPath()
+
+	// Enforce streaming body reader limit (protects against unbounded chunked bodies)
+	if rg.cfg.MaxRequestBodyBytes > 0 && rClean.Body != nil {
+		rClean.Body = http.MaxBytesReader(w, rClean.Body, rg.cfg.MaxRequestBodyBytes)
+	}
 
 	priority := rg.classifier(rClean)
 	if rg.cfg.TrustClientPriority {
@@ -218,8 +355,10 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		statusCode:     http.StatusOK,
 	}
 
+	ctxWithWriter := context.WithValue(ctxWithTrace, statusWriterKey, wrappedWriter)
+
 	// Strip incoming priority header and sync cleaned path before proxying
-	rOut := rClean.WithContext(ctxWithTrace)
+	rOut := rClean.WithContext(ctxWithWriter)
 	rOut.Header.Del(rg.cfg.PriorityHeader)
 
 	// Step 5: Panic & Mid-Body Abort Protection:
@@ -300,6 +439,19 @@ type statusResponseWriter struct {
 func (w *statusResponseWriter) WriteHeader(code int) {
 	w.statusCode = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
 }
 
 // Unwrap exposes the underlying ResponseWriter for Go's ResponseController, Flusher, and Hijacker.
