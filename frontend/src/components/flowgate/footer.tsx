@@ -34,9 +34,13 @@ export function FlowGateFooter() {
         >
           License (MIT)
         </Link>
-        <a href="#testbench" className="hover:text-[var(--fg)] hover:no-underline">
+        <button
+          type="button"
+          onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+          className="hover:text-[var(--fg)] hover:no-underline cursor-pointer bg-transparent border-0 p-0 text-xs text-[var(--muted)] hover:text-[var(--fg)] transition-colors"
+        >
           Back to Top ↑
-        </a>
+        </button>
 
         <button
           type="button"

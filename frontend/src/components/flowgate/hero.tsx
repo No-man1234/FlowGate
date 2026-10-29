@@ -1,8 +1,19 @@
+"use client";
+
 import { ArrowDown, Zap } from "lucide-react";
 import Link from "next/link";
 import { GithubIcon } from "./icons";
 
 export function FlowGateHero() {
+  const scrollToTestbench = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    e.preventDefault();
+    const el = document.getElementById("testbench");
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+      history.pushState(null, "", "#testbench");
+    }
+  };
+
   return (
     <section className="flex flex-col gap-8 py-8 md:py-12 border-b border-[var(--line)]">
       {/* Badge */}
@@ -30,7 +41,8 @@ export function FlowGateHero() {
       <div className="flex flex-wrap items-center gap-3 pt-2">
         <a
           href="#testbench"
-          className="btn-primary inline-flex items-center gap-2 px-5 py-2.5 rounded-full font-medium text-sm no-underline hover:no-underline hover:opacity-90 transition-opacity shadow-xs text-[var(--bg)] bg-[var(--fg)]"
+          onClick={scrollToTestbench}
+          className="btn-primary inline-flex items-center gap-2 px-5 py-2.5 rounded-full font-medium text-sm no-underline hover:no-underline hover:opacity-90 transition-opacity shadow-xs text-[var(--bg)] bg-[var(--fg)] cursor-pointer"
           style={{ color: "var(--bg)", backgroundColor: "var(--fg)", textDecoration: "none" }}
         >
           <Zap className="w-4 h-4 fill-current" />

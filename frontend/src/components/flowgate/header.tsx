@@ -8,6 +8,15 @@ import { useThemeTransition } from "@/hooks/use-theme-transition";
 export function FlowGateHeader() {
   const { isDark, toggleTheme } = useThemeTransition();
 
+  const handleNavClick = (id: string) => (e: React.MouseEvent<HTMLAnchorElement>) => {
+    e.preventDefault();
+    const el = document.getElementById(id);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+      history.pushState(null, "", `#${id}`);
+    }
+  };
+
   return (
     <header className="site-header flex items-center justify-between gap-4 py-4 border-b border-[var(--line)]">
       {/* Brand */}
@@ -25,19 +34,19 @@ export function FlowGateHeader() {
 
       {/* Navigation */}
       <nav className="hidden md:flex items-center gap-6 text-[14px] text-[var(--muted)]">
-        <a href="#testbench" className="hover:text-[var(--fg)] hover:no-underline transition-colors">
+        <a href="#testbench" onClick={handleNavClick("testbench")} className="hover:text-[var(--fg)] hover:no-underline transition-colors cursor-pointer">
           Interactive Testbench
         </a>
-        <a href="#problem" className="hover:text-[var(--fg)] hover:no-underline transition-colors">
+        <a href="#problem" onClick={handleNavClick("problem")} className="hover:text-[var(--fg)] hover:no-underline transition-colors cursor-pointer">
           The Problem
         </a>
-        <a href="#how-it-works" className="hover:text-[var(--fg)] hover:no-underline transition-colors">
+        <a href="#how-it-works" onClick={handleNavClick("how-it-works")} className="hover:text-[var(--fg)] hover:no-underline transition-colors cursor-pointer">
           How It Works
         </a>
-        <a href="#benchmarks" className="hover:text-[var(--fg)] hover:no-underline transition-colors">
+        <a href="#benchmarks" onClick={handleNavClick("benchmarks")} className="hover:text-[var(--fg)] hover:no-underline transition-colors cursor-pointer">
           Benchmarks
         </a>
-        <a href="#quickstart" className="hover:text-[var(--fg)] hover:no-underline transition-colors">
+        <a href="#quickstart" onClick={handleNavClick("quickstart")} className="hover:text-[var(--fg)] hover:no-underline transition-colors cursor-pointer">
           Quickstart
         </a>
       </nav>

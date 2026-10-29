@@ -377,7 +377,7 @@ export function FlowGateVisualizer() {
     .join(" ");
 
   return (
-    <section id="testbench" className="flex flex-col gap-8 py-12 border-b border-[var(--line)]">
+    <section id="testbench" className="flex flex-col gap-8 py-12 border-b border-[var(--line)] scroll-mt-8">
       {/* Header of Testbench */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-col gap-1">
@@ -895,18 +895,29 @@ export function FlowGateVisualizer() {
       </div>
 
       {/* Real-Time Request Inspector Log */}
-      <div className="p-5 rounded-2xl border border-[var(--line)] bg-[var(--bg)] flex flex-col gap-3">
-        <div className="flex items-center justify-between">
+      <div className="p-4 sm:p-5 rounded-2xl border border-[var(--line)] bg-[var(--bg)] flex flex-col gap-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-[var(--line)] pb-3">
           <h3 className="text-xs uppercase tracking-wider font-semibold text-[var(--muted)] flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
             Live Request Stream (Gateway Decisions)
           </h3>
-          <span className="text-xs font-mono text-[var(--muted)]">
-            Total: {stats.total} | 200 OK: {stats.ok200} | 429 Shed: {stats.shed429} | 503 Breaker: {stats.breaker503}
-          </span>
+          <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
+            <span className="px-2 py-0.5 rounded bg-[var(--chip)] text-[var(--fg2)] border border-[var(--line)]">
+              Total: <strong className="text-[var(--fg)]">{stats.total}</strong>
+            </span>
+            <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+              200 OK: <strong>{stats.ok200}</strong>
+            </span>
+            <span className="px-2 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+              429 Shed: <strong>{stats.shed429}</strong>
+            </span>
+            <span className="px-2 py-0.5 rounded bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20">
+              503 Breaker: <strong>{stats.breaker503}</strong>
+            </span>
+          </div>
         </div>
 
-        <div className="font-mono text-xs max-h-56 overflow-y-auto divide-y divide-[var(--line)] border border-[var(--line)] rounded-xl bg-[var(--chip)]">
+        <div className="font-mono text-xs max-h-60 overflow-y-auto overflow-x-hidden divide-y divide-[var(--line)] border border-[var(--line)] rounded-xl bg-[var(--chip)]">
           {logs.length === 0 ? (
             <div className="p-4 text-center text-[var(--muted)]">
               No requests recorded yet. Click &quot;Start Traffic&quot; above to watch real-time gateway decisions.
@@ -915,32 +926,43 @@ export function FlowGateVisualizer() {
             logs.map((log) => (
               <div
                 key={log.id}
-                className="flex items-center justify-between gap-4 p-2.5 hover:bg-[var(--chip-hover)] transition-colors"
+                className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5 sm:gap-4 p-2.5 hover:bg-[var(--chip-hover)] transition-colors min-w-0"
               >
-                <div className="flex items-center gap-3 min-w-0">
-                  <span
-                    className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                      log.status === 200
-                        ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
-                        : log.status === 429
-                        ? "bg-amber-500/20 text-amber-600 dark:text-amber-400"
-                        : log.status === 503
-                        ? "bg-rose-500/20 text-rose-600 dark:text-rose-400"
-                        : "bg-purple-500/20 text-purple-600 dark:text-purple-400"
-                    }`}
-                  >
-                    {log.status}
-                  </span>
-                  <span className="font-bold text-[var(--fg)]">{log.method}</span>
-                  <span className="text-[var(--fg2)] truncate">{log.path}</span>
-                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-[var(--bg)] text-[var(--muted)] border border-[var(--line)] uppercase">
-                    {log.priority}
-                  </span>
+                {/* Line 1 on mobile, left block on desktop */}
+                <div className="flex items-center justify-between sm:justify-start gap-2.5 min-w-0">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className={`px-2 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                        log.status === 200
+                          ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                          : log.status === 429
+                          ? "bg-amber-500/20 text-amber-600 dark:text-amber-400"
+                          : log.status === 503
+                          ? "bg-rose-500/20 text-rose-600 dark:text-rose-400"
+                          : "bg-purple-500/20 text-purple-600 dark:text-purple-400"
+                      }`}
+                    >
+                      {log.status}
+                    </span>
+                    <span className="font-bold text-[var(--fg)] shrink-0">{log.method}</span>
+                    <span className="text-[var(--fg2)] truncate max-w-[130px] sm:max-w-[220px]">{log.path}</span>
+                    <span className="hidden sm:inline-block text-[10px] px-1.5 py-0.2 rounded bg-[var(--bg)] text-[var(--muted)] border border-[var(--line)] uppercase shrink-0">
+                      {log.priority}
+                    </span>
+                  </div>
+                  {/* Latency right-aligned on mobile line 1 */}
+                  <span className="sm:hidden font-bold text-[var(--fg)] shrink-0 text-right">{log.latencyMs}ms</span>
                 </div>
 
-                <div className="flex items-center gap-4 text-right whitespace-nowrap text-[var(--muted)]">
-                  <span>{log.reason}</span>
-                  <span className="font-bold text-[var(--fg)]">{log.latencyMs}ms</span>
+                {/* Line 2 on mobile, right block on desktop */}
+                <div className="flex items-center justify-between sm:justify-end gap-2 sm:gap-4 text-right text-[var(--muted)] min-w-0">
+                  {/* Priority badge on mobile line 2 */}
+                  <span className="sm:hidden text-[10px] px-1.5 py-0.2 rounded bg-[var(--bg)] text-[var(--muted)] border border-[var(--line)] uppercase shrink-0">
+                    {log.priority}
+                  </span>
+                  <span className="truncate sm:whitespace-nowrap text-[11px] sm:text-xs text-[var(--muted)]">{log.reason}</span>
+                  {/* Latency right-aligned on desktop */}
+                  <span className="hidden sm:inline-block font-bold text-[var(--fg)] shrink-0 min-w-[45px] text-right">{log.latencyMs}ms</span>
                 </div>
               </div>
             ))
