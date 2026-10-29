@@ -87,32 +87,33 @@ $$\text{Limit}_{\text{next}} = \text{Limit}_{\text{current}} \times \text{clampe
 * **$\text{Tolerance}$ (default: $1.25$):** Allows normal network jitter up to 25% above baseline before capacity contracts.
 
 ### 2. Server-Side Priority Classification & Tiered Shedding
-When capacity contracts, FlowGate protects high-value business transactions:
+When capacity contracts, FlowGate protects high-value business transactions using tiered concurrency ceilings on a shared counter:
 
-* **Critical (`PriorityCritical`)**: Allowed up to 100% capacity (payments, authentication, checkout).
-* **Standard (`PriorityStandard`)**: Allowed up to 85% capacity (normal browsing, search).
-* **Best-Effort (`PriorityBestEffort`)**: Shed first when in-flight reaches 70% capacity (analytics, webhooks, prefetching).
+* **Critical (`PriorityCritical`)**: Allowed up to 100% capacity ceiling (payments, authentication, checkout).
+* **Standard (`PriorityStandard`)**: Allowed up to 85% capacity ceiling (normal browsing, search).
+* **Best-Effort (`PriorityBestEffort`)**: Shed first when in-flight reaches 70% capacity ceiling (analytics, webhooks, prefetching).
 
-FlowGate includes a **built-in server-side path classifier**:
+FlowGate includes a **built-in server-side path classifier** with strict segment boundary checking:
 * `/checkout`, `/payments`, `/auth`, `/orders` $\rightarrow$ `Critical`
 * `/analytics`, `/metrics`, `/logs`, `/webhooks` $\rightarrow$ `Best-Effort`
 * All other paths $\rightarrow$ `Standard`
 
-> **Security Note:** In production, client-supplied `X-Priority` headers are ignored by default (`-trust-priority=false`) to prevent priority spoofing.
+> **Security Note:** In production, client-supplied `X-Priority` headers are ignored by default (`-trust-priority=false`) to prevent priority spoofing. Path cleaning (`path.Clean`) ensures directory traversals (e.g. `/auth/../search`) cannot spoof critical classification.
 
 ### 3. Fast-Fail Circuit Breaker
-If an upstream service suffers repeated crashes ($5\text{xx}$ errors or network timeouts), the circuit breaker trips `OPEN`, rejecting traffic in **$< 0.1\text{ms}$** without touching the upstream network stack. After a cooldown window, it shifts to `HALF-OPEN` to safely probe recovery.
+If an upstream service suffers repeated crashes ($5\text{xx}$ errors or network timeouts), the circuit breaker trips `OPEN`, rejecting traffic without touching the upstream network stack. After a cooldown window, it shifts to `HALF-OPEN` to safely probe recovery with generation-stamped cancellation.
 
 Gateway-generated `429` shed responses never count toward upstream circuit breaker trips.
 
-### 4. Zero-Allocation Parallel Performance
-Measured with Go's race detector and parallel microbenchmarks on an AMD Ryzen 7 5800U:
+### 4. Parallel Benchmark Hierarchy
+Measured on an AMD Ryzen 7 5800U across multiple layers of abstraction (`go test -bench=. -benchmem ./...`):
 
-| Component / Path | Throughput / Latency | Memory / Op | Allocations |
-| :--- | :--- | :--- | :--- |
-| **Limiter Shedding Hot-Path** (`Acquire` rejected) | **61.50 ns/op** | **0 B/op** | **0 allocs/op** |
-| **Limiter Admitted Hot-Path** (`Acquire` + `Done`) | **125.40 ns/op** | **0 B/op** | **0 allocs/op** |
-| **Full Gateway HTTP Fast-Fail** (`gw.ServeHTTP` 429) | **202.80 ns/op** | **128 B/op** | **3 allocs/op** |
+| Layer / Measurement | Latency / Op | Memory / Op | Allocations | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Limiter Shed Hot-Path** | **61.50 ns/op** | **0 B/op** | **0 allocs/op** | In-memory atomic rejection |
+| **Limiter Admitted Hot-Path** | **125.40 ns/op** | **24 B/op** | **1 allocs/op** | Atomic CAS + `sync.Once` token |
+| **In-Process HTTP Handler Shed** | **647.10 ns/op** | **680 B/op** | **11 allocs/op** | Full `gw.ServeHTTP` via `httptest.ResponseRecorder` |
+| **End-to-End OS TCP Socket Shed** | **65.40 µs/op** | **11.0 KB/op** | **86 allocs/op** | Full loopback TCP stack (`http.Client` -> socket -> gateway -> response) |
 
 ---
 

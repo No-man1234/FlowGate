@@ -8,6 +8,7 @@ import (
 	"net/http/httptrace"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -27,7 +28,9 @@ type GatewayConfig struct {
 	PriorityHeader      string         // e.g. "X-Priority"
 	TrustClientPriority bool           // If true, client-supplied priority headers are respected (default: false)
 	Classifier          ClassifierFunc // Custom server-side request priority classifier
-	ClientTimeout       time.Duration  // Max time client request is allowed to wait (default: 30s)
+	CriticalPrefixes    []string       // Configurable path prefixes for critical tier (e.g. ["/checkout", "/auth"])
+	BestEffortPrefixes  []string       // Configurable path prefixes for best-effort tier (e.g. ["/analytics", "/logs"])
+	ClientTimeout       time.Duration  // Max time to wait for upstream response headers (default: 15s)
 	RetryAfterSeconds   int            // Retry-After header value on shed (default: 1)
 	MaxIdleConns        int            // Pool capacity (default: 20000)
 	MaxIdleConnsPerHost int            // Pool per upstream host (default: 10000)
@@ -44,27 +47,32 @@ type ResilientGateway struct {
 	classifier ClassifierFunc
 }
 
-// DefaultClassifier maps standard REST path prefixes to priority tiers.
-func DefaultClassifier(r *http.Request) limiter.Priority {
-	p := strings.ToLower(r.URL.Path)
+// hasSegmentPrefix checks if path matches prefix as an exact segment or directory prefix.
+func hasSegmentPrefix(p, prefix string) bool {
+	prefix = strings.TrimSuffix(prefix, "/")
+	return p == prefix || strings.HasPrefix(p, prefix+"/")
+}
 
-	// Critical business operations
-	if strings.HasPrefix(p, "/checkout") ||
-		strings.HasPrefix(p, "/payments") ||
-		strings.HasPrefix(p, "/auth") ||
-		strings.HasPrefix(p, "/orders") {
-		return limiter.PriorityCritical
+// BuildDefaultClassifier creates a path-based classifier using exact segment boundaries.
+func BuildDefaultClassifier(critical, bestEffort []string) ClassifierFunc {
+	return func(r *http.Request) limiter.Priority {
+		clean := path.Clean("/" + r.URL.Path)
+		p := strings.ToLower(clean)
+
+		for _, pre := range critical {
+			if hasSegmentPrefix(p, strings.ToLower(pre)) {
+				return limiter.PriorityCritical
+			}
+		}
+
+		for _, pre := range bestEffort {
+			if hasSegmentPrefix(p, strings.ToLower(pre)) {
+				return limiter.PriorityBestEffort
+			}
+		}
+
+		return limiter.PriorityStandard
 	}
-
-	// Background or non-essential traffic
-	if strings.HasPrefix(p, "/analytics") ||
-		strings.HasPrefix(p, "/metrics") ||
-		strings.HasPrefix(p, "/logs") ||
-		strings.HasPrefix(p, "/webhooks") {
-		return limiter.PriorityBestEffort
-	}
-
-	return limiter.PriorityStandard
 }
 
 // NewGateway creates and configures a ResilientGateway.
@@ -87,28 +95,36 @@ func NewGateway(
 		cfg.MaxIdleConnsPerHost = 10000
 	}
 	if cfg.ClientTimeout <= 0 {
-		cfg.ClientTimeout = 30 * time.Second
+		cfg.ClientTimeout = 15 * time.Second
+	}
+
+	if len(cfg.CriticalPrefixes) == 0 {
+		cfg.CriticalPrefixes = []string{"/checkout", "/payments", "/auth", "/orders"}
+	}
+	if len(cfg.BestEffortPrefixes) == 0 {
+		cfg.BestEffortPrefixes = []string{"/analytics", "/metrics", "/logs", "/webhooks"}
 	}
 
 	classifier := cfg.Classifier
 	if classifier == nil {
-		classifier = DefaultClassifier
+		classifier = BuildDefaultClassifier(cfg.CriticalPrefixes, cfg.BestEffortPrefixes)
 	}
 
 	// High-performance transport tuned to prevent connection churn under high concurrency
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: nil, // Zero-cost direct routing for internal reverse proxies
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
+		DisableCompression:   true, // Avoid gzip CPU serialization overhead on proxy path
 		MaxIdleConns:          cfg.MaxIdleConns,
 		MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second,
+		ResponseHeaderTimeout: cfg.ClientTimeout,
 	}
 
 	rg := &ResilientGateway{
@@ -158,8 +174,12 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: Request Priority Classification
-	priority := rg.classifier(r)
+	// Step 2: Clean path and Request Priority Classification
+	cleanPath := path.Clean("/" + r.URL.Path)
+	rClean := r.Clone(r.Context())
+	rClean.URL.Path = cleanPath
+
+	priority := rg.classifier(rClean)
 	if rg.cfg.TrustClientPriority {
 		if val := r.Header.Get(rg.cfg.PriorityHeader); val != "" {
 			priority = limiter.ParsePriority(val)
@@ -198,11 +218,31 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		statusCode:     http.StatusOK,
 	}
 
-	// Strip incoming priority header before proxying upstream to avoid internal confusion
-	rOut := r.Clone(ctxWithTrace)
+	// Strip incoming priority header and sync cleaned path before proxying
+	rOut := rClean.WithContext(ctxWithTrace)
 	rOut.Header.Del(rg.cfg.PriorityHeader)
 
+	// Step 5: Panic & Mid-Body Abort Protection:
+	// ReverseProxy panics with http.ErrAbortHandler when a client disconnects mid-body.
+	// This defer ensures the limiter token and breaker slot are ALWAYS released even on panic!
+	settled := false
+	defer func() {
+		if settled {
+			return
+		}
+		// Mid-body panic or aborted copy
+		if r.Context().Err() != nil {
+			rg.breaker.Cancel(gen)
+			token.Release()
+		} else {
+			rg.metrics.UpstreamErrors.Add(1)
+			rg.breaker.RecordFailure(gen)
+			token.Done(time.Since(start), true)
+		}
+	}()
+
 	rg.proxy.ServeHTTP(wrappedWriter, rOut)
+	settled = true
 
 	// Determine latency for feedback
 	var rtt time.Duration
@@ -212,7 +252,7 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rtt = time.Since(start)
 	}
 
-	// Step 5: Handle Results and Segregate Client Aborts from Upstream Failures
+	// Step 6: Handle Results and Segregate Client Aborts from Upstream Failures
 	isClientCancel := r.Context().Err() != nil || errors.Is(wrappedWriter.proxyErr, context.Canceled)
 
 	switch {

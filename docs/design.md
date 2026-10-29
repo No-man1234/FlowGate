@@ -61,10 +61,10 @@ In Netflix's `concurrency-limits` library:
 ## 3. Threat Model: Priority Spoofing (`X-Priority`)
 
 ### Vulnerability
-FlowGate supports priority-tiered load shedding:
-* `Critical`: 100% capacity reserved (payments, checkout).
-* `Standard`: 85% capacity reserved.
-* `Best-Effort`: 70% capacity reserved (background jobs, webhooks).
+FlowGate supports priority-tiered load shedding via concurrency ceilings on a single shared in-flight counter:
+* `Critical`: 100% capacity ceiling (payments, checkout).
+* `Standard`: 85% capacity ceiling.
+* `Best-Effort`: 70% capacity ceiling (background jobs, webhooks).
 
 If client requests are exposed directly to the public internet, malicious clients could send `X-Priority: critical` to bypass shedding and starve legitimate users.
 

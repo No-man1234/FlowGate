@@ -22,6 +22,7 @@ type Server struct {
 type Config struct {
 	Addr              string
 	Handler           http.Handler
+	ReadTimeout       time.Duration
 	ReadHeaderTimeout time.Duration
 	IdleTimeout       time.Duration
 	DrainTimeout      time.Duration
@@ -29,6 +30,9 @@ type Config struct {
 
 // New creates a production-hardened Server.
 func New(cfg Config) *Server {
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = 15 * time.Second
+	}
 	if cfg.ReadHeaderTimeout <= 0 {
 		cfg.ReadHeaderTimeout = 5 * time.Second
 	}
@@ -44,6 +48,7 @@ func New(cfg Config) *Server {
 		httpServer: &http.Server{
 			Addr:              cfg.Addr,
 			Handler:           cfg.Handler,
+			ReadTimeout:       cfg.ReadTimeout,
 			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 			IdleTimeout:       cfg.IdleTimeout,
 		},

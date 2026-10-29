@@ -169,6 +169,10 @@ func (cb *CircuitBreaker) RecordFailure(gen uint64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if gen != cb.generation {
+		return // Straggler from previous generation; ignore to prevent stale failure accumulation
+	}
+
 	switch cb.state {
 	case StateClosed:
 		cb.consecutiveFails++

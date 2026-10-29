@@ -17,6 +17,7 @@ type GradientConfig struct {
 	Tolerance    float64       // Tolerance factor for gradient before throttling (default: 1.25, allows 25% jitter)
 	BackoffRatio float64       // Multiplicative reduction upon severe timeout/5xx (default: 0.75)
 	MinRTTWindow time.Duration // Window to refresh minRTT baseline to adapt to infra shifts (default: 30s)
+	Now          func() time.Time // Injectable clock for deterministic testing (defaults to time.Now)
 
 	// Thresholds for priority tiers (percentage of current limit)
 	StandardThreshold   float64 // default: 0.85 (sheds standard when in-flight >= 85% limit)
@@ -33,6 +34,7 @@ func DefaultConfig() GradientConfig {
 		Tolerance:           1.25,
 		BackoffRatio:        0.75,
 		MinRTTWindow:        30 * time.Second,
+		Now:                 time.Now,
 		StandardThreshold:   0.85,
 		BestEffortThreshold: 0.70,
 	}
@@ -52,18 +54,14 @@ type GradientLimiter struct {
 	shedBest     atomic.Uint64
 
 	// Concurrency state protected by mu
-	mu              sync.RWMutex
-	currentLimit    float64
-	minRTT          time.Duration
-	sampleRTT       time.Duration
-	candidateMinRTT time.Duration
-	windowStart     time.Time
-}
-
-var tokenPool = sync.Pool{
-	New: func() any {
-		return &gradientToken{}
-	},
+	mu                 sync.RWMutex
+	currentLimit       float64
+	minRTT             time.Duration
+	sampleRTT          time.Duration
+	candidateMinRTT    time.Duration
+	lowestLoadRTT      time.Duration
+	lowestLoadInFlight int64
+	windowStart        time.Time
 }
 
 // NewGradientLimiter creates a configured GradientLimiter with validated parameters.
@@ -92,6 +90,9 @@ func NewGradientLimiter(cfg GradientConfig) *GradientLimiter {
 	if cfg.MinRTTWindow <= 0 {
 		cfg.MinRTTWindow = 30 * time.Second
 	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 	if cfg.StandardThreshold <= 0 {
 		cfg.StandardThreshold = 0.85
 	}
@@ -100,9 +101,10 @@ func NewGradientLimiter(cfg GradientConfig) *GradientLimiter {
 	}
 
 	return &GradientLimiter{
-		cfg:          cfg,
-		currentLimit: cfg.InitialLimit,
-		windowStart:  time.Now(),
+		cfg:                cfg,
+		currentLimit:       cfg.InitialLimit,
+		lowestLoadInFlight: math.MaxInt64,
+		windowStart:        cfg.Now(),
 	}
 }
 
@@ -149,10 +151,9 @@ func (g *GradientLimiter) Acquire(ctx context.Context, priority Priority) (Token
 	}
 
 	g.accepted.Add(1)
-	tok := tokenPool.Get().(*gradientToken)
-	tok.limiter = g
-	tok.done = 0
-	return tok, true
+	return &gradientToken{
+		limiter: g,
+	}, true
 }
 
 // onDone updates the limiter's RTT tracking and adjusts the dynamic limit.
@@ -173,27 +174,52 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 		return
 	}
 
-	now := time.Now()
+	now := g.cfg.Now()
+
+	// Fallback sample tracking for saturated conditions:
+	// Always record the sample that experienced the lowest concurrency
+	if inFlight < g.lowestLoadInFlight {
+		g.lowestLoadInFlight = inFlight
+		g.lowestLoadRTT = rtt
+	}
 
 	// Anti-ratchet guard:
-	// Only update candidateMinRTT from samples taken when the system is NOT queuing.
-	// If in-flight was well below limit (e.g. <= 50% capacity or <= 5 in-flight),
-	// this is a valid measurement of unqueued service time.
-	isUnqueuedSample := float64(inFlight) <= g.currentLimit*0.5 || inFlight <= 5
+	// Only update candidateMinRTT from samples taken when inFlight <= 50% capacity.
+	isUnqueuedSample := float64(inFlight) <= g.currentLimit*0.5
 	if isUnqueuedSample {
 		if g.candidateMinRTT == 0 || rtt < g.candidateMinRTT {
 			g.candidateMinRTT = rtt
 		}
 	}
 
+	// Window expiration and baseline update
 	if now.Sub(g.windowStart) >= g.cfg.MinRTTWindow || g.minRTT == 0 {
-		if g.candidateMinRTT > 0 {
-			g.minRTT = g.candidateMinRTT
-		} else if g.minRTT == 0 {
-			g.minRTT = rtt
+		newMin := g.candidateMinRTT
+		if newMin == 0 && g.lowestLoadRTT > 0 {
+			// Fallback when constantly saturated:
+			// Only allow gradual upward drift (max 20% per window) if suspected drift,
+			// but reject large spikes (e.g. 5x-10x queuing delays) to prevent ratcheting.
+			if g.minRTT > 0 && g.lowestLoadRTT <= time.Duration(float64(g.minRTT)*1.25) {
+				newMin = g.lowestLoadRTT
+			}
 		}
-		// Reset candidate for next window
+
+		if newMin > 0 {
+			// Capped baseline rise: cannot jump by more than 25% in a single window
+			maxRise := time.Duration(float64(g.minRTT) * 1.25)
+			if g.minRTT == 0 || newMin < g.minRTT {
+				g.minRTT = newMin
+			} else if maxRise > 0 && newMin > maxRise {
+				g.minRTT = maxRise
+			} else {
+				g.minRTT = newMin
+			}
+		}
+
+		// Reset window tracking
 		g.candidateMinRTT = 0
+		g.lowestLoadRTT = 0
+		g.lowestLoadInFlight = math.MaxInt64
 		g.windowStart = now
 	} else if rtt < g.minRTT {
 		g.minRTT = rtt
@@ -275,19 +301,17 @@ func (g *GradientLimiter) Stats() Snapshot {
 
 type gradientToken struct {
 	limiter *GradientLimiter
-	done    uint32
+	once    sync.Once
 }
 
 func (t *gradientToken) Done(rtt time.Duration, isError bool) {
-	if atomic.CompareAndSwapUint32(&t.done, 0, 1) {
+	t.once.Do(func() {
 		t.limiter.onDone(rtt, isError)
-		tokenPool.Put(t)
-	}
+	})
 }
 
 func (t *gradientToken) Release() {
-	if atomic.CompareAndSwapUint32(&t.done, 0, 1) {
+	t.once.Do(func() {
 		t.limiter.onRelease()
-		tokenPool.Put(t)
-	}
+	})
 }

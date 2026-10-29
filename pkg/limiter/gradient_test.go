@@ -256,3 +256,110 @@ func TestLimiter_ConcurrentAcquireDone(t *testing.T) {
 		t.Fatalf("expected inFlight == 0 at end of concurrent test, got %d", l.InFlight())
 	}
 }
+
+func TestLimiter_StaleDoneIsNoop(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.InitialLimit = 10
+	l := NewGradientLimiter(cfg)
+
+	tok, ok := l.Acquire(context.Background(), PriorityStandard)
+	if !ok {
+		t.Fatalf("expected acquire to succeed")
+	}
+
+	if l.InFlight() != 1 {
+		t.Fatalf("expected inFlight == 1, got %d", l.InFlight())
+	}
+
+	// First Done() releases the slot
+	tok.Done(10*time.Millisecond, false)
+	if l.InFlight() != 0 {
+		t.Fatalf("expected inFlight == 0, got %d", l.InFlight())
+	}
+
+	// Second and third stale Done() calls MUST be no-ops!
+	tok.Done(10*time.Millisecond, false)
+	tok.Release()
+
+	if l.InFlight() != 0 {
+		t.Fatalf("stale Done() decremented in-flight! got %d", l.InFlight())
+	}
+}
+
+func TestLimiter_SustainedQueueingNoBaselineRise(t *testing.T) {
+	currentTime := time.Now()
+	clock := func() time.Time { return currentTime }
+
+	cfg := DefaultConfig()
+	cfg.InitialLimit = 5
+	cfg.MinLimit = 5
+	cfg.MinRTTWindow = 10 * time.Second
+	cfg.Now = clock
+	l := NewGradientLimiter(cfg)
+
+	// Step 1: Establish healthy 15ms baseline
+	tok, _ := l.Acquire(context.Background(), PriorityCritical)
+	tok.Done(15*time.Millisecond, false)
+
+	if l.MinRTT() != 15*time.Millisecond {
+		t.Fatalf("expected baseline 15ms, got %v", l.MinRTT())
+	}
+
+	// Step 2: 3 windows of heavy queuing at limit=5 with 4 in flight (80%) and 150ms latency
+	for window := 0; window < 3; window++ {
+		currentTime = currentTime.Add(11 * time.Second) // Advance clock past window
+
+		var active []Token
+		for i := 0; i < 4; i++ {
+			t, _ := l.Acquire(context.Background(), PriorityCritical)
+			active = append(active, t)
+		}
+
+		for _, t := range active {
+			t.Done(150*time.Millisecond, false)
+		}
+	}
+
+	// Baseline must NOT have ratcheted up to 150ms!
+	if l.MinRTT() > 35*time.Millisecond {
+		t.Fatalf("sustained queuing at floor ratcheted baseline! was 15ms, now %v", l.MinRTT())
+	}
+}
+
+func TestLimiter_BaselineShiftRecoversWhenSaturated(t *testing.T) {
+	currentTime := time.Now()
+	clock := func() time.Time { return currentTime }
+
+	cfg := DefaultConfig()
+	cfg.InitialLimit = 20
+	cfg.MinLimit = 5
+	cfg.MinRTTWindow = 10 * time.Second
+	cfg.Now = clock
+	l := NewGradientLimiter(cfg)
+
+	// Initial baseline 15ms
+	tok, _ := l.Acquire(context.Background(), PriorityCritical)
+	tok.Done(15*time.Millisecond, false)
+
+	// Saturated traffic at 90% load where backend has permanently moved to 25ms
+	for window := 0; window < 4; window++ {
+		currentTime = currentTime.Add(11 * time.Second)
+
+		var active []Token
+		for i := 0; i < 18; i++ {
+			t, ok := l.Acquire(context.Background(), PriorityCritical)
+			if ok {
+				active = append(active, t)
+			}
+		}
+
+		for _, t := range active {
+			t.Done(25*time.Millisecond, false)
+		}
+	}
+
+	// Fallback candidate must allow baseline to adapt toward 25ms rather than staying frozen at 15ms
+	if l.MinRTT() < 20*time.Millisecond {
+		t.Fatalf("expected baseline to adapt toward permanent 25ms shift, got %v", l.MinRTT())
+	}
+}

@@ -340,3 +340,122 @@ func TestResilientGateway_CircuitBreaker503(t *testing.T) {
 		t.Fatalf("expected 1 breaker trip metric, got %d", m.BreakerTrips.Load())
 	}
 }
+
+func TestGateway_ClientDisconnectMidBodyReleasesSlot(t *testing.T) {
+	// Upstream that writes headers then blocks/sleeps during body write
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Write partial chunk then wait
+		_, _ = w.Write([]byte("chunk1"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(200 * time.Millisecond)
+		_, _ = w.Write([]byte("chunk2"))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	l := limiter.NewGradientLimiter(limiter.DefaultConfig())
+	cb := breaker.New(breaker.DefaultConfig())
+	m := metrics.NewCollector()
+
+	gateway := NewGateway(
+		GatewayConfig{UpstreamURL: upstreamURL},
+		l,
+		cb,
+		m,
+	)
+
+	// Fire 10 requests where client disconnects mid-download
+	for i := 0; i < 10; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+
+		req := httptest.NewRequest("GET", "/download", nil).WithContext(ctx)
+		w := httptest.NewRecorder()
+		gateway.ServeHTTP(w, req)
+	}
+
+	// Verify limiter slot is NEVER leaked on mid-body abort!
+	if l.InFlight() != 0 {
+		t.Fatalf("limiter slot leaked on client mid-body disconnect! inFlight = %d (expected 0)", l.InFlight())
+	}
+}
+
+func TestDefaultClassifier_Boundaries(t *testing.T) {
+	classifier := BuildDefaultClassifier(
+		[]string{"/checkout", "/payments", "/auth", "/orders"},
+		[]string{"/analytics", "/metrics", "/logs", "/webhooks"},
+	)
+
+	tests := []struct {
+		path     string
+		expected limiter.Priority
+	}{
+		{"/checkout", limiter.PriorityCritical},
+		{"/checkout/pay", limiter.PriorityCritical},
+		{"/CHECKOUT/submit", limiter.PriorityCritical},
+		{"/checkout-preview", limiter.PriorityStandard}, // boundary: prefix without slash
+		{"/authors", limiter.PriorityStandard},          // boundary: contains auth but is not auth
+		{"/auth/../search", limiter.PriorityStandard},   // path traversal cleaned
+		{"/auth/login", limiter.PriorityCritical},
+		{"/orders-export.csv", limiter.PriorityStandard}, // boundary
+		{"/orders/recent", limiter.PriorityCritical},
+		{"/analytics", limiter.PriorityBestEffort},
+		{"/analytics/v2/track", limiter.PriorityBestEffort},
+		{"/analytics-reports", limiter.PriorityStandard}, // boundary
+		{"/search", limiter.PriorityStandard},
+	}
+
+	for _, tc := range tests {
+		req := httptest.NewRequest("GET", tc.path, nil)
+		actual := classifier(req)
+		if actual != tc.expected {
+			t.Errorf("path %s: expected priority %s, got %s", tc.path, tc.expected, actual)
+		}
+	}
+}
+
+func TestGateway_SSEFlushesIncrementally(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			_, _ = fmt.Fprint(w, "data: event1\n\n")
+			f.Flush()
+			time.Sleep(20 * time.Millisecond)
+			_, _ = fmt.Fprint(w, "data: event2\n\n")
+			f.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	l := limiter.NewGradientLimiter(limiter.DefaultConfig())
+	cb := breaker.New(breaker.DefaultConfig())
+	m := metrics.NewCollector()
+
+	gateway := NewGateway(
+		GatewayConfig{UpstreamURL: upstreamURL},
+		l,
+		cb,
+		m,
+	)
+
+	w := httptest.NewRecorder()
+	gateway.ServeHTTP(w, httptest.NewRequest("GET", "/events", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for SSE, got %d", w.Code)
+	}
+
+	body := w.Body.String()
+	if body != "data: event1\n\ndata: event2\n\n" {
+		t.Fatalf("unexpected SSE body: %q", body)
+	}
+}
