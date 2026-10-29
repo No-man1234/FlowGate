@@ -104,3 +104,30 @@ FlowGate strictly separates gateway-level load shedding from upstream infrastruc
 
 * **`429 Too Many Requests` (RFC 6585):** Used for adaptive concurrency shedding. Indicates the client should back off and includes a `Retry-After: 1` header.
 * **`503 Service Unavailable` (RFC 9110):** Reserved for when the Circuit Breaker trips `OPEN` due to hard upstream service outages.
+
+---
+
+## 7. Multi-Node Gateway Topology & Distributed Sizing
+
+### Shared-Nothing vs. Centralized State (Why No Redis?)
+A common architectural question is: *"Why doesn't FlowGate use a shared Redis cluster to synchronize in-flight counters across multiple gateway pods?"*
+
+FlowGate intentionally adopts a **shared-nothing architecture** for three production reasons:
+1. **Zero Latency Penalty on the Hot Path:** A Redis round-trip adds 1–3ms of network latency. FlowGate makes concurrency and breaker decisions in **147 nanoseconds** entirely in local CPU cache.
+2. **Blast Radius Isolation (No Single Point of Failure):** If an external Redis cluster experiences latency or crashes, an entire API gateway layer that relies on it fails simultaneously. A shared-nothing design guarantees that every gateway pod remains independently resilient.
+3. **Lock Contention Under Load:** Under 50,000+ req/sec, concurrent Redis atomic operations (`INCR`/`DECR` or Lua scripts) suffer severe serialization bottlenecks and network queueing.
+
+### Sizing and Cluster Math
+When deploying $N$ gateway instances behind a Layer 4 or Layer 7 load balancer (e.g., AWS ALB, Cloudflare, NGINX, or Kubernetes Ingress):
+
+$$\text{Per-Node Concurrency Limit} = \left(\frac{C_{\text{target}}}{N}\right) \times F_{\text{imbalance}}$$
+
+Where:
+* $C_{\text{target}}$ is the total concurrent capacity your downstream database or thread pool can handle without degrading (e.g. 100 connections).
+* $N$ is the number of active gateway replica pods.
+* $F_{\text{imbalance}}$ is a safety margin factor (typically $1.1$ to $1.25$) to absorb minor traffic distribution unevenness across pods.
+
+### Traffic Imbalance & Natural Convergence
+Because each FlowGate instance independently measures upstream round-trip latency (RTT):
+* If Pod A receives $60\%$ of traffic and Pod B receives $40\%$, both pods observe the **exact same downstream latency** (since latency is determined by downstream service load, not the gateway pod).
+* Both pods will independently and accurately discover the system's saturation point and begin shedding excess load with synchronized precision, without exchanging a single cross-node packet.

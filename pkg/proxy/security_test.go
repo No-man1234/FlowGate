@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bufio"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -225,24 +227,26 @@ func TestSecurity_PriorityClassification_MatrixAndPrefixBypass(t *testing.T) {
 // isStreamingResponse returns false, causing multi-hour session duration to be
 // fed into token.Done(rtt, false), permanently collapsing gateway limit to floor.
 // ============================================================================
+type mockHijackRecorder struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+}
+
+func (m *mockHijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	m.hijacked = true
+	return nil, nil, nil
+}
+
 func TestSecurity_WebSocket_StatusResponseWriter_Hijack(t *testing.T) {
-	rec := httptest.NewRecorder()
+	rec := &mockHijackRecorder{ResponseRecorder: httptest.NewRecorder()}
 	sw := &statusResponseWriter{
 		ResponseWriter: rec,
-		statusCode:     http.StatusOK, // initialized to 200
+		statusCode:     http.StatusOK,
 	}
 
-	// When ReverseProxy hijacks a 101 upgrade, it writes the HTTP 101 response
-	// directly to the hijacked connection buffer (brw) and does NOT call sw.WriteHeader(101).
-	// Therefore sw.statusCode remains 200.
-
-	contentType := "application/octet-stream"
-	isStream := isStreamingResponse(contentType, sw.statusCode)
-
-	t.Logf("statusResponseWriter statusCode after hijack: %d", sw.statusCode)
-	t.Logf("isStreamingResponse evaluated to: %v (expected: true for WebSocket)", isStream)
-
+	_, _, _ = sw.Hijack()
+	isStream := isStreamingResponse("application/octet-stream", sw.statusCode, sw.hijacked)
 	if !isStream {
-		t.Logf("[CONFIRMED VULNERABILITY] Limiter Poisoning: WebSocket 101 response is not recognized as streaming because statusCode remains 200. Multi-hour session duration will be recorded as latency in token.Done(rtt, false), crashing the adaptive limit.")
+		t.Fatalf("expected WebSocket hijacked connection to be recognized as streaming, got false")
 	}
 }

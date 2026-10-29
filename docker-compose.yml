@@ -1,0 +1,37 @@
+services:
+  # 1. Mock Upstream Service (Simulates 15ms latency & chaos bottlenecks)
+  upstream:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/app/upstream"]
+    command: ["-port", "9090", "-latency", "15", "-capacity", "20"]
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  # 2. FlowGate Resilient API Gateway (Adaptive Concurrency & Circuit Breaking)
+  flowgate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/app/flowgate"]
+    command: ["-port", "8080", "-upstream", "http://upstream:9090", "-initial-limit", "20", "-dashboard=false"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - upstream
+    restart: unless-stopped
+
+  # 3. Interactive Web Testbench & Visualizer
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+    depends_on:
+      - flowgate
+    restart: unless-stopped

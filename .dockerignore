@@ -1,0 +1,9 @@
+bin/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+.git/
+*.test
+*.out
+coverage.txt
+.DS_Store

@@ -1,4 +1,4 @@
-.PHONY: all build test bench clean run-upstream run-gateway benchmark frontend-install frontend-dev frontend-build
+.PHONY: all build test bench clean run-upstream run-gateway benchmark frontend-install frontend-dev frontend-build docker-up docker-down
 
 BINARY_DIR=bin
 GO=go
@@ -11,6 +11,12 @@ build:
 	$(GO) build -v -o $(BINARY_DIR)/flowgate ./cmd/flowgate
 	$(GO) build -v -o $(BINARY_DIR)/upstream ./cmd/upstream
 	$(GO) build -v -o $(BINARY_DIR)/loadgen ./cmd/loadgen
+
+docker-up:
+	docker compose up --build
+
+docker-down:
+	docker compose down
 
 frontend-install:
 	@echo "Installing frontend dependencies..."

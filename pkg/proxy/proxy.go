@@ -411,9 +411,10 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Healthy interaction:
 		rg.breaker.RecordSuccess(gen)
 
-		// If streaming (SSE text/event-stream or WebSocket 101 Switching Protocols),
+		// If streaming (SSE text/event-stream, WebSocket 101, hijacked socket, or upgrade),
 		// release token without poisoning the latency feedback loop with stream duration!
-		if isStreamingResponse(wrappedWriter.Header().Get("Content-Type"), wrappedWriter.statusCode) {
+		isUpgrade := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+		if isStreamingResponse(wrappedWriter.Header().Get("Content-Type"), wrappedWriter.statusCode, wrappedWriter.hijacked || isUpgrade) {
 			token.Release()
 		} else {
 			token.Done(rtt, false)
@@ -421,8 +422,8 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func isStreamingResponse(contentType string, code int) bool {
-	if code == http.StatusSwitchingProtocols {
+func isStreamingResponse(contentType string, code int, isUpgradeOrHijacked bool) bool {
+	if isUpgradeOrHijacked || code == http.StatusSwitchingProtocols {
 		return true
 	}
 	return strings.HasPrefix(contentType, "text/event-stream")
@@ -434,6 +435,7 @@ type statusResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
 	proxyErr   error
+	hijacked   bool
 }
 
 func (w *statusResponseWriter) WriteHeader(code int) {
@@ -449,6 +451,8 @@ func (w *statusResponseWriter) Flush() {
 
 func (w *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		w.hijacked = true
+		w.statusCode = http.StatusSwitchingProtocols
 		return hj.Hijack()
 	}
 	return nil, nil, http.ErrNotSupported

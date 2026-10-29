@@ -130,7 +130,16 @@ Measured on an AMD Ryzen 7 5800U across multiple layers of abstraction (`go test
 
 ## Quickstart
 
-### Prerequisites
+### 0. Instant Testing via Docker Compose (Recommended)
+Spin up the entire ecosystem—the mock chaos upstream (port `9090`), the FlowGate adaptive proxy (port `8080`), and the interactive web visualizer (port `3000`)—with a single command:
+```bash
+docker compose up --build
+```
+Then open [http://localhost:3000](http://localhost:3000) to experiment with live load shedding and chaos injection in real time.
+
+---
+
+### Prerequisites (For Local Go Development)
 * Go 1.23+
 
 ### 1. Installation & Clone
@@ -155,6 +164,9 @@ git clone https://github.com/No-man1234/FlowGate.git
 cd FlowGate
 go build -o bin/ ./cmd/...
 ```
+
+#### Option C: Download Pre-compiled Binary
+Grab pre-built, statically linked binaries for Linux (amd64/arm64), macOS (Intel/Apple Silicon), and Windows from the [GitHub Releases](https://github.com/No-man1234/FlowGate/releases) page.
 
 ### 2. Run the Mock Upstream Server
 Simulates a backend service with a baseline latency of 15ms that degrades if overloaded beyond 20 concurrent requests:
@@ -207,6 +219,18 @@ npm install
 npm run dev
 ```
 Open [http://localhost:3000](http://localhost:3000) to simulate live concurrency dynamics, gradient limit shrinking, circuit breaker tripping, and priority tier shedding in real time.
+
+---
+
+## Multi-Node & Clustered Deployments
+
+FlowGate uses a **shared-nothing architecture** rather than centralized Redis locks:
+* **Zero Hot-Path Latency Penalty:** Redis adds 1–3ms of network round-trip overhead. FlowGate makes limit and circuit decisions in **147 nanoseconds** in local CPU cache.
+* **No Single Point of Failure (SPOF):** If a central caching tier fails or partitions, your entire API gateway layer remains completely resilient.
+* **Natural Multi-Pod Convergence:** When running multiple FlowGate instances behind an AWS ALB or Kubernetes Ingress, each pod independently measures downstream RTT. Because downstream latency reflects overall backend saturation, all pods independently converge on the exact same capacity limits and shed excess traffic with synchronized precision.
+
+**Sizing formula for $N$ gateway replicas:**
+$$\text{Per-Node Concurrency Limit} = \left(\frac{\text{Target Backend Capacity}}{N}\right) \times 1.15$$
 
 ---
 
