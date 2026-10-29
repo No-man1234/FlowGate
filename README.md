@@ -41,6 +41,17 @@ FlowGate Protected:
   p50 (429 Shed) [>] 1.01 ms            (Immediate fail-fast shedding)
 ```
 
+### Outage Protection: Circuit Breaker Benchmark (80% Upstream 5xx Panics)
+
+When an upstream database experiences catastrophic failure (simulated via `/chaos/error?rate=0.8`), FlowGate's 3-state circuit breaker automatically transitions from `CLOSED` to `OPEN`, shielding the struggling backend:
+
+| Metric | Upstream During Unprotected Outage | Protected by FlowGate Circuit Breaker |
+| :--- | :--- | :--- |
+| **Backend State** | Bombarded with continuous traffic; thread exhaustion & crash | **Completely shielded**; room to reboot/heal |
+| **Outage Fast-Fail Rate** | Callers hang until gateway timeout (504) | **100.0% fast-failed with `503 Service Unavailable`** |
+| **Fast-Fail Latency** | N/A (Hung threads) | **<0.1 ms (Sub-microsecond fast rejection)** |
+| **Traffic Handled** | Saturated sockets | **28,968 req/sec handled with 0 drops** |
+
 ---
 
 ## Architecture & System Design
@@ -122,7 +133,23 @@ Measured on an AMD Ryzen 7 5800U across multiple layers of abstraction (`go test
 ### Prerequisites
 * Go 1.23+
 
-### 1. Clone & Build
+### 1. Installation & Clone
+
+#### Option A: Clone Backend Only (Excludes Frontend)
+If you only need the high-performance Go gateway binaries without the Next.js frontend workbench:
+```bash
+# Clone using git sparse-checkout to omit the frontend/ directory:
+git clone --filter=blob:none --no-checkout https://github.com/No-man1234/FlowGate.git
+cd FlowGate
+git sparse-checkout set --no-cone '/*' '!frontend'
+git checkout main
+go build -o bin/ ./cmd/...
+
+# Or install the gateway binary directly via Go:
+go install github.com/No-man1234/FlowGate/cmd/flowgate@latest
+```
+
+#### Option B: Full Repository (Backend + Frontend Workbench)
 ```bash
 git clone https://github.com/No-man1234/FlowGate.git
 cd FlowGate

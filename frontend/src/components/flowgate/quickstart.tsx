@@ -12,11 +12,16 @@ export function FlowGateQuickstart() {
     setTimeout(() => setCopiedIndex(null), 2000);
   };
 
-  const cliSnippet = `# Clone repository
-git clone https://github.com/No-man1234/FlowGate.git
+  const cliSnippet = `# Clone backend only (excluding frontend directory):
+git clone --filter=blob:none --no-checkout https://github.com/No-man1234/FlowGate.git
 cd FlowGate
+git sparse-checkout set --no-cone '/*' '!frontend'
+git checkout main
 
-# Start the Mock Upstream Server (injects latency & chaos)
+# Or install binary directly with Go:
+go install github.com/No-man1234/FlowGate/cmd/flowgate@latest
+
+# Start the Mock Upstream Server (simulates 15ms latency & chaos)
 go run cmd/upstream/main.go -port 9000
 
 # Start FlowGate Gateway with adaptive concurrency protection
@@ -79,13 +84,17 @@ func main() {
           </div>
 
           <div className="p-4 rounded-xl bg-[var(--bg)] border border-[var(--line)] text-xs font-mono overflow-x-auto leading-relaxed shadow-xs flex flex-col gap-1 text-[var(--fg)]">
-            <div className="text-[var(--muted)]"># 1. Clone repository</div>
+            <div className="text-[var(--muted)]"># 1. Clone backend only (excludes frontend directory)</div>
             <div>
-              <span className="text-emerald-700 dark:text-emerald-400 font-semibold">git clone</span>{" "}
-              https://github.com/No-man1234/FlowGate.git
+              <span className="text-emerald-700 dark:text-emerald-400 font-semibold">git clone</span> --filter=blob:none --no-checkout https://github.com/No-man1234/FlowGate.git
             </div>
             <div>
-              <span className="text-emerald-700 dark:text-emerald-400 font-semibold">cd</span> FlowGate
+              <span className="text-emerald-700 dark:text-emerald-400 font-semibold">cd</span> FlowGate &amp;&amp; git sparse-checkout set --no-cone &apos;/*&apos; &apos;!frontend&apos; &amp;&amp; git checkout main
+            </div>
+
+            <div className="mt-2 text-[var(--muted)]"># Or install binary directly with Go:</div>
+            <div>
+              <span className="text-emerald-700 dark:text-emerald-400 font-semibold">go install</span> github.com/No-man1234/FlowGate/cmd/flowgate@latest
             </div>
 
             <div className="mt-2 text-[var(--muted)]"># 2. Start mock upstream service (simulates latency &amp; chaos)</div>
