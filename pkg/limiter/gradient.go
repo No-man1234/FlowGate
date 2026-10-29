@@ -38,14 +38,14 @@ func DefaultConfig() GradientConfig {
 	}
 }
 
-// GradientLimiter is an adaptive concurrency limiter based on Netflix's Gradient2 algorithm.
-// It dynamically tracks RTT drift to detect queuing and prevent upstream collapse.
+// GradientLimiter is an adaptive concurrency limiter using a Gradient-style
+// controller with a windowed min-RTT baseline.
 type GradientLimiter struct {
 	cfg GradientConfig
 
 	inFlight atomic.Int64
 
-	// Metrics counters
+	// Lock-free metrics counters
 	accepted     atomic.Uint64
 	shedCritical atomic.Uint64
 	shedStandard atomic.Uint64
@@ -58,6 +58,12 @@ type GradientLimiter struct {
 	sampleRTT       time.Duration
 	candidateMinRTT time.Duration
 	windowStart     time.Time
+}
+
+var tokenPool = sync.Pool{
+	New: func() any {
+		return &gradientToken{}
+	},
 }
 
 // NewGradientLimiter creates a configured GradientLimiter.
@@ -107,7 +113,6 @@ func (g *GradientLimiter) Acquire(ctx context.Context, priority Priority) (Token
 	limit := g.currentLimit
 	g.mu.RUnlock()
 
-	// Determine allowed capacity threshold based on priority tier
 	var maxAllowed float64
 	switch priority {
 	case PriorityCritical:
@@ -124,10 +129,9 @@ func (g *GradientLimiter) Acquire(ctx context.Context, priority Priority) (Token
 		maxAllowed = g.cfg.MinLimit
 	}
 
-	// Optimistically increment in-flight count
 	currentInFlight := g.inFlight.Add(1)
 
-	// If over the allowed threshold, reject immediately (shed load)
+	// If over allowed threshold, fast-fail shed (0 allocs, sub-microsecond)
 	if float64(currentInFlight) > maxAllowed {
 		g.inFlight.Add(-1)
 		switch priority {
@@ -142,14 +146,16 @@ func (g *GradientLimiter) Acquire(ctx context.Context, priority Priority) (Token
 	}
 
 	g.accepted.Add(1)
-	return &gradientToken{
-		limiter: g,
-	}, true
+	tok := tokenPool.Get().(*gradientToken)
+	tok.limiter = g
+	tok.done = 0
+	return tok, true
 }
 
 // onDone updates the limiter's RTT tracking and adjusts the dynamic limit.
 func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
-	defer g.inFlight.Add(-1)
+	inFlightBefore := g.inFlight.Add(-1)
+	inFlight := inFlightBefore + 1 // in-flight count while request was executing
 
 	if rtt <= 0 {
 		return
@@ -160,19 +166,25 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 
 	now := time.Now()
 
-	// Windowed minRTT tracking with candidate window:
-	// Avoids setting minRTT to an anomalous spike if the reset happens during a brownout.
-	if g.candidateMinRTT == 0 || rtt < g.candidateMinRTT {
-		g.candidateMinRTT = rtt
+	// Anti-ratchet guard:
+	// Only update candidateMinRTT from samples taken when the system is NOT severely queued.
+	// If in-flight was well below limit (e.g. <= 50% capacity or <= 5 in-flight),
+	// this is a clean measurement of unqueued service time.
+	isUnqueuedSample := float64(inFlight) <= g.currentLimit*0.5 || inFlight <= 5
+	if isUnqueuedSample {
+		if g.candidateMinRTT == 0 || rtt < g.candidateMinRTT {
+			g.candidateMinRTT = rtt
+		}
 	}
 
 	if now.Sub(g.windowStart) >= g.cfg.MinRTTWindow || g.minRTT == 0 {
 		if g.candidateMinRTT > 0 {
 			g.minRTT = g.candidateMinRTT
-		} else {
+		} else if g.minRTT == 0 {
 			g.minRTT = rtt
 		}
-		g.candidateMinRTT = rtt
+		// Reset candidate for next window
+		g.candidateMinRTT = 0
 		g.windowStart = now
 	} else if rtt < g.minRTT {
 		g.minRTT = rtt
@@ -186,51 +198,58 @@ func (g *GradientLimiter) onDone(rtt time.Duration, isError bool) {
 		g.sampleRTT = time.Duration(float64(g.sampleRTT)*(1.0-alpha) + float64(rtt)*alpha)
 	}
 
-	// Severe errors trigger aggressive multiplicative backoff
+	// Severe errors trigger aggressive backoff
 	if isError {
 		g.currentLimit = math.Max(g.cfg.MinLimit, g.currentLimit*g.cfg.BackoffRatio)
 		return
 	}
 
-	// Netflix Gradient2 algorithm:
-	// rawGradient = (minRTT / sampleRTT) * tolerance
-	// gradient = clamp(rawGradient, 0.5, 1.0)
 	if g.sampleRTT <= 0 || g.minRTT <= 0 {
 		return
 	}
 
+	// Gradient calculation:
+	// rawGradient = (minRTT / sampleRTT) * tolerance
+	// gradient = clamp(rawGradient, 0.5, 1.0)
 	rawGradient := (float64(g.minRTT) / float64(g.sampleRTT)) * g.cfg.Tolerance
 	gradient := math.Max(0.5, math.Min(1.0, rawGradient))
 
-	// Queue headroom probe factor: beta = sqrt(currentLimit)
-	queueSize := math.Sqrt(g.currentLimit)
+	// App-Limited Guard:
+	// Only probe limit upward (+sqrt(limit)) if in-flight was actually testing capacity.
+	// If in-flight is below half capacity, the system is client/app-limited, not saturated;
+	// adding probe terms during idle would artificially inflate the limit to infinity.
+	isTestingCapacity := float64(inFlight) >= g.currentLimit*0.5
 
-	// New Limit = Current * Gradient + QueueSize
-	newLimit := g.currentLimit*gradient + queueSize
+	var probe float64
+	if isTestingCapacity && gradient >= 1.0 {
+		probe = math.Sqrt(g.currentLimit)
+	}
 
-	// Bound between MinLimit and MaxLimit
+	newLimit := g.currentLimit*gradient + probe
 	newLimit = math.Max(g.cfg.MinLimit, math.Min(g.cfg.MaxLimit, newLimit))
 	g.currentLimit = newLimit
 }
 
-// onRelease decrements in-flight without affecting RTT calculations.
 func (g *GradientLimiter) onRelease() {
 	g.inFlight.Add(-1)
 }
 
-// CurrentLimit returns the current dynamic concurrency ceiling.
 func (g *GradientLimiter) CurrentLimit() float64 {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return g.currentLimit
 }
 
-// InFlight returns the number of active requests currently executing.
 func (g *GradientLimiter) InFlight() int64 {
 	return g.inFlight.Load()
 }
 
-// Stats returns a thread-safe snapshot of limiter state.
+func (g *GradientLimiter) MinRTT() time.Duration {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.minRTT
+}
+
 func (g *GradientLimiter) Stats() Snapshot {
 	g.mu.RLock()
 	limit := g.currentLimit
@@ -252,17 +271,19 @@ func (g *GradientLimiter) Stats() Snapshot {
 
 type gradientToken struct {
 	limiter *GradientLimiter
-	once    sync.Once
+	done    uint32
 }
 
 func (t *gradientToken) Done(rtt time.Duration, isError bool) {
-	t.once.Do(func() {
+	if atomic.CompareAndSwapUint32(&t.done, 0, 1) {
 		t.limiter.onDone(rtt, isError)
-	})
+		tokenPool.Put(t)
+	}
 }
 
 func (t *gradientToken) Release() {
-	t.once.Do(func() {
+	if atomic.CompareAndSwapUint32(&t.done, 0, 1) {
 		t.limiter.onRelease()
-	})
+		tokenPool.Put(t)
+	}
 }

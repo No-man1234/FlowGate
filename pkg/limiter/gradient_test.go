@@ -130,7 +130,7 @@ func TestGradientLimiter_DynamicLimitContractionOnLatencySpike(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		tok, ok := l.Acquire(context.Background(), PriorityCritical)
 		if !ok {
-			continue // May start shedding
+			continue
 		}
 		tok.Done(200*time.Millisecond, false)
 	}
@@ -139,6 +139,65 @@ func TestGradientLimiter_DynamicLimitContractionOnLatencySpike(t *testing.T) {
 	if contractedLimit >= initialHealthyLimit {
 		t.Fatalf("expected limit to contract under 200ms latency spike (was %.2f, now %.2f)",
 			initialHealthyLimit, contractedLimit)
+	}
+}
+
+func TestGradientLimiter_SustainedQueuingDoesNotInflateBaseline(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.InitialLimit = 20
+	cfg.MinLimit = 5
+	cfg.MinRTTWindow = 50 * time.Millisecond // fast window for test
+	l := NewGradientLimiter(cfg)
+
+	// Step 1: Establish true unloaded baseline at 10ms with 1 concurrent request
+	for i := 0; i < 10; i++ {
+		tok, _ := l.Acquire(context.Background(), PriorityCritical)
+		tok.Done(10*time.Millisecond, false)
+	}
+
+	trueBaseline := l.MinRTT()
+	if trueBaseline != 10*time.Millisecond {
+		t.Fatalf("expected true baseline 10ms, got %v", trueBaseline)
+	}
+
+	// Step 2: Simulate sustained saturation where in-flight is held at capacity
+	// and response times are inflated to 50ms (5x queueing delay) over multiple window resets
+	time.Sleep(60 * time.Millisecond) // Trigger window rollover
+
+	// Saturate the limiter
+	var tokens []Token
+	for i := 0; i < int(l.CurrentLimit()); i++ {
+		if tok, ok := l.Acquire(context.Background(), PriorityCritical); ok {
+			tokens = append(tokens, tok)
+		}
+	}
+
+	// Release saturated tokens under severe queuing
+	for _, tok := range tokens {
+		tok.Done(50*time.Millisecond, false)
+	}
+
+	// The anti-ratchet guard must prevent 50ms saturated queuing from inflating the baseline
+	ratchetBaseline := l.MinRTT()
+	if ratchetBaseline > 20*time.Millisecond {
+		t.Fatalf("ratchet failure: sustained queuing inflated baseline to %v (should stay near 10ms)", ratchetBaseline)
+	}
+}
+
+func TestGradientLimiter_AppLimitedDoesNotInflateIdle(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.InitialLimit = 50
+	l := NewGradientLimiter(cfg)
+
+	// Run low concurrency traffic (1 request at a time, well below capacity of 50)
+	for i := 0; i < 50; i++ {
+		tok, _ := l.Acquire(context.Background(), PriorityCritical)
+		tok.Done(10*time.Millisecond, false)
+	}
+
+	// The app-limited guard must prevent idle probes from inflating the limit endlessly
+	if l.CurrentLimit() > 65 {
+		t.Fatalf("expected limit not to inflate during app-limited idle periods, got %.2f", l.CurrentLimit())
 	}
 }
 
