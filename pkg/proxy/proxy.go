@@ -7,6 +7,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/No-man1234/FlowGate/pkg/breaker"
@@ -14,25 +15,53 @@ import (
 	"github.com/No-man1234/FlowGate/pkg/metrics"
 )
 
+// ClassifierFunc inspects an incoming request and determines its priority tier.
+type ClassifierFunc func(r *http.Request) limiter.Priority
+
 // GatewayConfig holds operational configuration for the reverse proxy.
 type GatewayConfig struct {
 	UpstreamURL         *url.URL
-	PriorityHeader      string        // e.g. "X-Priority"
-	TrustClientPriority bool          // If false, untrusted client-supplied priority headers are ignored (default: false)
-	ClientTimeout       time.Duration // Max time client request is allowed to wait
-	RetryAfterSeconds   int           // Retry-After header value on shed (default: 1)
-	MaxIdleConns        int           // Pool capacity (default: 20000)
-	MaxIdleConnsPerHost int           // Pool per upstream host (default: 10000)
+	PriorityHeader      string         // e.g. "X-Priority"
+	TrustClientPriority bool           // If true, client-supplied priority headers are respected (default: false)
+	Classifier          ClassifierFunc // Custom server-side request priority classifier
+	ClientTimeout       time.Duration  // Max time client request is allowed to wait
+	RetryAfterSeconds   int            // Retry-After header value on shed (default: 1)
+	MaxIdleConns        int            // Pool capacity (default: 20000)
+	MaxIdleConnsPerHost int            // Pool per upstream host (default: 10000)
 }
 
 // ResilientGateway integrates Adaptive Concurrency Limiting, Circuit Breaking,
 // and tuned HTTP connection pooling.
 type ResilientGateway struct {
-	cfg     GatewayConfig
-	limiter limiter.Limiter
-	breaker *breaker.CircuitBreaker
-	metrics *metrics.Collector
-	proxy   *httputil.ReverseProxy
+	cfg        GatewayConfig
+	limiter    limiter.Limiter
+	breaker    *breaker.CircuitBreaker
+	metrics    *metrics.Collector
+	proxy      *httputil.ReverseProxy
+	classifier ClassifierFunc
+}
+
+// DefaultClassifier maps standard REST path prefixes to priority tiers.
+func DefaultClassifier(r *http.Request) limiter.Priority {
+	p := strings.ToLower(r.URL.Path)
+
+	// Critical business operations
+	if strings.HasPrefix(p, "/checkout") ||
+		strings.HasPrefix(p, "/payments") ||
+		strings.HasPrefix(p, "/auth") ||
+		strings.HasPrefix(p, "/orders") {
+		return limiter.PriorityCritical
+	}
+
+	// Background or non-essential traffic
+	if strings.HasPrefix(p, "/analytics") ||
+		strings.HasPrefix(p, "/metrics") ||
+		strings.HasPrefix(p, "/logs") ||
+		strings.HasPrefix(p, "/webhooks") {
+		return limiter.PriorityBestEffort
+	}
+
+	return limiter.PriorityStandard
 }
 
 // NewGateway creates and configures a ResilientGateway.
@@ -55,7 +84,12 @@ func NewGateway(
 		cfg.MaxIdleConnsPerHost = 10000
 	}
 
-	// High-performance transport tuned to prevent connection churn under 10k+ requests
+	classifier := cfg.Classifier
+	if classifier == nil {
+		classifier = DefaultClassifier
+	}
+
+	// High-performance transport tuned to prevent connection churn under high concurrency
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -72,10 +106,11 @@ func NewGateway(
 	}
 
 	rg := &ResilientGateway{
-		cfg:     cfg,
-		limiter: l,
-		breaker: cb,
-		metrics: m,
+		cfg:        cfg,
+		limiter:    l,
+		breaker:    cb,
+		metrics:    m,
+		classifier: classifier,
 	}
 
 	revProxy := httputil.NewSingleHostReverseProxy(cfg.UpstreamURL)
@@ -110,16 +145,18 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: Adaptive Concurrency Check (Load Shedding / Backpressure)
-	priority := limiter.PriorityStandard
+	// Step 2: Request Priority Classification
+	priority := rg.classifier(r)
 	if rg.cfg.TrustClientPriority {
-		priorityVal := r.Header.Get(rg.cfg.PriorityHeader)
-		priority = limiter.ParsePriority(priorityVal)
+		if val := r.Header.Get(rg.cfg.PriorityHeader); val != "" {
+			priority = limiter.ParsePriority(val)
+		}
 	}
 
+	// Step 3: Adaptive Concurrency Check (Load Shedding / Backpressure)
 	token, ok := rg.limiter.Acquire(r.Context(), priority)
 	if !ok {
-		// Fast-fail rejection in < 0.2ms
+		// Fast-fail rejection: Does NOT touch upstream, does NOT trip breaker
 		rg.metrics.ShedRequests.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", strconv.Itoa(rg.cfg.RetryAfterSeconds))
@@ -130,7 +167,7 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rg.metrics.AcceptedRequests.Add(1)
 
-	// Step 3: Forward to Upstream with latency timing
+	// Step 4: Forward to Upstream with latency timing
 	start := time.Now()
 	wrappedWriter := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 
@@ -146,7 +183,7 @@ func (rg *ResilientGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rg.breaker.RecordSuccess()
 	}
 
-	// Step 4: Feedback loop to Adaptive Limiter
+	// Step 5: Feedback loop to Adaptive Limiter
 	token.Done(rtt, isServerErr)
 }
 
