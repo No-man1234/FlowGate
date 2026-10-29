@@ -23,50 +23,42 @@ FlowGate treats concurrency limit discovery not as a static configuration proble
 
 ---
 
-## 2. Mathematical Formulation: Netflix Gradient2
+## 2. Algorithm Taxonomy: Gradient with Windowed Min-RTT
 
-FlowGate implements an adaptation of the **Netflix Gradient2** algorithm, which relates observed latency drift to queuing build-up.
+### Nomenclature & Netflix Lineage
+In Netflix's `concurrency-limits` library:
+* **`GradientLimit` (v1):** Compared short-term RTT against a windowed minimum RTT ($RTT_{\text{min}}$).
+* **`Gradient2Limit` (v2):** Compared a short-term EWMA against a long-term EWMA, tracking downward drift without storing discrete minimums.
 
-### The Algorithm
+**FlowGate implements a Gradient-style controller with a windowed min-RTT baseline**, enhanced with an **anti-ratchet filter** and an **app-limited guard**:
+
+### Mathematical Formulation
 
 1. **Baseline Tracking ($RTT_{\text{min}}$):**
-   Represents the latency of the upstream service when it is completely unloaded (pure computation + network propagation without queueing).
+   Tracks the minimum latency observed over a 30s evaluation window. To prevent sustained queuing from corrupting the baseline, only samples taken during unqueued conditions ($\text{InFlight} \le 0.5 \times \text{Limit}$) are eligible as candidate minimums.
 2. **Current Smoothing ($RTT_{\text{sample}}$):**
    An Exponentially Weighted Moving Average (EWMA) of observed round-trip times:
    $$RTT_{\text{sample}} = \alpha \times RTT_{\text{observed}} + (1 - \alpha) \times RTT_{\text{sample}}$$
-   Where $\alpha \in (0, 1]$ (default: $0.2$).
+   Where $\alpha = 0.2$.
 3. **Gradient Calculation:**
    $$\text{rawGradient} = \left(\frac{RTT_{\text{min}}}{RTT_{\text{sample}}}\right) \times \text{Tolerance}$$
    $$\text{clampedGradient} = \max\left(0.5, \min\left(1.0, \text{rawGradient}\right)\right)$$
-4. **Limit Adjustment:**
-   $$\text{Limit}_{\text{new}} = \text{Limit}_{\text{current}} \times \text{clampedGradient} + \sqrt{\text{Limit}_{\text{current}}}$$
+4. **App-Limited Probing & Limit Adjustment:**
+   $$\text{Limit}_{\text{new}} = \text{Limit}_{\text{current}} \times \text{clampedGradient} + \text{Probe}$$
+   Where $\text{Probe} = \sqrt{\text{Limit}_{\text{current}}}$ **only if** $\text{InFlight} \ge 0.5 \times \text{Limit}_{\text{current}}$ and $\text{clampedGradient} \ge 1.0$.
 
-### Why These Parameters Matter
+### Why These Guards Matter
 
+* **Anti-Ratchet Filter (Mitigating Sustained Queuing):** 
+  If a backend sits at its limit and queues for an entire 30s window, raw samples will all be inflated. If a naive candidate window adopted these inflated samples, $RTT_{\text{min}}$ would rise, resetting the gradient to 1.0 and causing runaway queueing. FlowGate filters out samples taken when the system is operating near its ceiling ($\text{InFlight} > 0.5 \times \text{Limit}$).
+* **App-Limited Guard (Preventing Idle Inflation):** 
+  If incoming traffic is low (e.g. 2 req/s on a limit of 100), the system is app-limited, not saturated. Adding $+\sqrt{\text{Limit}}$ during idle periods would cause the limit to drift to infinity. Probing is only active when traffic is actively testing capacity.
 * **`Tolerance` (default: 1.25):** 
-  Because $RTT_{\text{sample}} \ge RTT_{\text{min}}$, the raw ratio $\frac{RTT_{\text{min}}}{RTT_{\text{sample}}}$ is always $\le 1.0$. Without multiplying by `Tolerance`, normal micro-jitter would trigger immediate contraction. A tolerance of `1.25` allows normal latency to drift up to 25% above baseline without dropping capacity.
-* **`clamp(0.5, 1.0)`:** 
-  Limits downward adjustment to at most 50% in a single calculation step, preventing an isolated outlier from abruptly reducing capacity to minimum floor.
-* **`queueSize = sqrt(Limit)`:** 
-  The additive increase term (probing factor). It allows the limiter to continuously probe for extra throughput when the upstream service scales or recovers.
+  Because $RTT_{\text{sample}} \ge RTT_{\text{min}}$, the raw ratio is always $\le 1.0$. Multiplying by `1.25` allows normal network jitter up to 25% above baseline without dropping capacity.
 
 ---
 
-## 3. Mitigating Stale $RTT_{\text{min}}$ (Baseline Drift)
-
-A fundamental failure mode in latency-based limiters is **stale baseline lock**:
-* If $RTT_{\text{min}}$ is fixed at 10ms, and the backend permanently migrates or deploys new features that shift legitimate baseline processing time to 25ms, the limiter would perceive all future traffic as overloaded and permanently throttle.
-* Conversely, if $RTT_{\text{min}}$ is reset naively during a brownout, an anomalous 500ms latency spike could become the new baseline, blinding the limiter to queueing.
-
-### FlowGate Solution: Windowed Candidate Minimums
-FlowGate tracks a `candidateMinRTT` within an evaluation window (default: 30 seconds):
-* Every incoming response updates `candidateMinRTT` if it is lower.
-* When the window expires, `RTT_min` shifts to the minimum observed during that window.
-* This allows FlowGate to track legitimate infrastructure changes while rejecting brief latency spikes from corrupting the baseline.
-
----
-
-## 4. Threat Model: Priority Spoofing (`X-Priority`)
+## 3. Threat Model: Priority Spoofing (`X-Priority`)
 
 ### Vulnerability
 FlowGate supports priority-tiered load shedding:
@@ -74,28 +66,41 @@ FlowGate supports priority-tiered load shedding:
 * `Standard`: 85% capacity reserved.
 * `Best-Effort`: 70% capacity reserved (background jobs, webhooks).
 
-If client requests are exposed directly to the public internet, malicious or selfish clients could send `X-Priority: critical` on every request to bypass shedding and starve legitimate users.
+If client requests are exposed directly to the public internet, malicious clients could send `X-Priority: critical` to bypass shedding and starve legitimate users.
 
 ### Mitigation Architecture
 * **`TrustClientPriority` Flag (default: `false`):** 
-  By default, FlowGate ignores client-supplied `X-Priority` headers and classifies all incoming requests as `PriorityStandard`.
-* **Trusted Edge Deployment:** 
-  In production, FlowGate must be placed behind an authenticated edge gateway (or WAF) that either:
-  1. Strips all `X-Priority` headers from public internet clients.
-  2. Sets `X-Priority` based on authenticated API keys, user tiers, or route paths (e.g. `/api/v1/checkout` -> `critical`, `/api/v1/search` -> `standard`).
+  By default, FlowGate ignores client-supplied `X-Priority` headers.
+* **Server-Side Path Classification:**
+  FlowGate includes a default server-side classifier that maps path prefixes internally:
+  * `/checkout`, `/payments`, `/auth`, `/orders` $\rightarrow$ `PriorityCritical`
+  * `/analytics`, `/metrics`, `/logs`, `/webhooks` $\rightarrow$ `PriorityBestEffort`
+  * All other routes $\rightarrow$ `PriorityStandard`
+* **Custom Classifier Hook:** Developers can supply a `ClassifierFunc` to extract priority from authenticated JWT claims or API keys.
 
 ---
 
-## 5. Failure Isolation: Gateway Sheds vs. Circuit Breaker
+## 4. Failure Isolation: Gateway Sheds vs. Circuit Breaker
 
-A critical bug in naïve proxy implementations is conflating **gateway load shedding** with **upstream failure**:
-* If FlowGate rejects a request with `429 Too Many Requests`, that rejection is generated by FlowGate itself in $< 0.1\mu\text{s}$.
-* It **never touches the upstream service** and **never increments the circuit breaker failure counter**.
-* The Circuit Breaker only counts actual upstream dial failures, socket drops, or $5\text{xx}$ responses originating from the target server.
+FlowGate strictly separates gateway-level load shedding from upstream infrastructure failure:
+* When FlowGate rejects an incoming request with `429 Too Many Requests`, the rejection is generated entirely by FlowGate in **$< 0.25\mu\text{s}$**.
+* It **never dials the upstream service** and **never increments the circuit breaker failure counter**.
+* The Circuit Breaker only trips upon actual upstream dial failures, socket drops, or upstream $5\text{xx}$ responses originating from the backend.
+* Enforced by unit test: `TestResilientGateway_Shed429DoesNotTripBreaker`.
+
+---
+
+## 5. Streaming, SSE, and WebSocket Protocols
+
+**Important limitation:** Long-lived streaming protocols (Server-Sent Events, WebSockets, gRPC bidirectional streams) hold connections open for minutes or hours. 
+* Measuring request-completion RTT on streaming endpoints produces artificial durations equal to the stream lifetime, which would instantly crush the adaptive limiter's capacity to minimum.
+* **Production Recommendation:** Streaming endpoints must either:
+  1. Bypass the adaptive concurrency limiter entirely.
+  2. Measure **Time to First Byte (TTFB)** upon handshake completion rather than connection close.
 
 ---
 
 ## 6. HTTP Status Code Choices: 429 vs 503
 
-* **`429 Too Many Requests` (RFC 6585):** Used for adaptive concurrency shedding. Indicates the client should throttle its rate, accompanied by a `Retry-After: 1` header.
-* **`503 Service Unavailable` (RFC 9110):** Reserved for when the Circuit Breaker trips `OPEN` due to hard upstream service death.
+* **`429 Too Many Requests` (RFC 6585):** Used for adaptive concurrency shedding. Indicates the client should back off and includes a `Retry-After: 1` header.
+* **`503 Service Unavailable` (RFC 9110):** Reserved for when the Circuit Breaker trips `OPEN` due to hard upstream service outages.
