@@ -172,6 +172,15 @@ curl.exe "http://127.0.0.1:9090/chaos/error?rate=0.5"
 curl.exe "http://127.0.0.1:9090/chaos/reset"
 ```
 
+### 5. Launch the Interactive Frontend Testbench
+FlowGate includes a full interactive Next.js visualizer testbench located in the `frontend/` directory:
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Open [http://localhost:3000](http://localhost:3000) to simulate live concurrency dynamics, gradient limit shrinking, circuit breaker tripping, and priority tier shedding in real time.
+
 ---
 
 ## Protocol Limitations: Streaming, SSE & WebSockets

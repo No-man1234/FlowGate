@@ -1,0 +1,367 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@font-face {
+  font-family: 'Instrument Sans Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400 700;
+  src: url('/fonts/instrument-sans.woff2') format('woff2');
+}
+
+:root, .theme {
+  --bg: #fdfdfc;
+  --fg: #111111;
+  --fg2: #3a3a3a;
+  --muted: #5c5c5c;
+  --faint: #686865;
+  --line: #eaeae7;
+  --chip: #f0f0ed;
+  --chip-hover: #e6e6e3;
+  --underline: #cfcfcc;
+  --img-border: transparent;
+  color-scheme: light;
+}
+
+.dark, .theme.dark {
+  --bg: #0e0e0d;
+  --fg: #ededea;
+  --fg2: #c9c9c5;
+  --muted: #b3b3af;
+  --faint: #9c9c98;
+  --line: #242422;
+  --chip: #1c1c1b;
+  --chip-hover: #292927;
+  --underline: #4a4a47;
+  --img-border: #242422;
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: 'Instrument Sans Variable', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+@layer base {
+  a {
+    color: inherit;
+    text-decoration: underline;
+    text-decoration-color: var(--underline);
+    text-underline-offset: 3px;
+    text-decoration-thickness: 1px;
+    transition: text-decoration-color 0.24s, color 0.15s, background-color 0.15s, border-color 0.15s;
+  }
+
+  a:hover {
+    text-decoration-color: var(--fg);
+  }
+
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--fg);
+    outline-offset: 3px;
+    border-radius: 4px;
+  }
+}
+
+.btn-primary {
+  background-color: var(--fg) !important;
+  color: var(--bg) !important;
+  text-decoration: none !important;
+}
+
+.btn-primary:hover {
+  opacity: 0.9;
+  color: var(--bg) !important;
+}
+
+@utility btn-primary {
+  background-color: var(--fg);
+  color: var(--bg);
+  text-decoration: none;
+}
+
+/* Avatar Flip Effect */
+.avatar-btn {
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  padding: 0;
+  display: block;
+}
+.avatar-btn:focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: 3px;
+}
+.flip {
+  perspective: 320px;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  display: block;
+}
+.flip-inner {
+  width: 100%;
+  height: 100%;
+  transform-style: preserve-3d;
+  transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  display: block;
+  position: relative;
+}
+.flip:hover .flip-inner, .flip.is-flipped .flip-inner {
+  transform: rotateY(180deg);
+}
+.flip-face {
+  object-fit: cover;
+  backface-visibility: hidden;
+  width: 100%;
+  height: 100%;
+  border-radius: 8px;
+  position: absolute;
+  inset: 0;
+}
+.flip-back {
+  transform: rotateY(180deg);
+}
+
+/* Gloss Card (Subsuperficie Latin Dictionary Tooltip) */
+.gloss-wrap {
+  position: relative;
+}
+.gloss {
+  cursor: help;
+  border-radius: 4px;
+  outline: none;
+}
+.gloss:focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: 4px;
+}
+.gloss-card {
+  z-index: 30;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transform-origin: 24px 0;
+  border-radius: 12px;
+  width: min(340px, 92vw);
+  padding: 14px 16px 15px;
+  transition: opacity 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1), visibility 0s 0.22s;
+  position: absolute;
+  top: calc(100% + 14px);
+  left: 0;
+  transform: translateY(-6px) scale(0.96);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 14px 36px -10px rgba(0, 0, 0, 0.25);
+}
+.gloss-card:before {
+  content: "";
+  background: var(--bg);
+  border-left: 1px solid var(--line);
+  border-top: 1px solid var(--line);
+  width: 10px;
+  height: 10px;
+  position: absolute;
+  top: -6px;
+  left: 22px;
+  transform: rotate(45deg);
+}
+.gloss-wrap:hover .gloss-card,
+.gloss-wrap:focus-within .gloss-card,
+.gloss:focus .gloss-card {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+  transition-delay: 0s;
+}
+.gloss-meta {
+  color: var(--faint);
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  font-style: italic;
+  display: flex;
+}
+.gloss-lang {
+  background: var(--chip);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-style: normal;
+}
+.gloss-words {
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0 8px;
+  display: flex;
+}
+.gloss-word {
+  align-items: baseline;
+  gap: 10px;
+  display: flex;
+}
+.gloss-word dt {
+  letter-spacing: -0.02em;
+  color: var(--fg);
+  font-size: 19px;
+  font-weight: 600;
+}
+.gloss-word dd {
+  color: var(--muted);
+  margin: 0;
+  font-size: 14.5px;
+}
+.gloss-note {
+  color: var(--muted);
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+/* Items & Cards */
+.item {
+  text-decoration: none;
+  position: relative;
+  isolation: isolate;
+  transition: color 0.15s;
+}
+.item:before {
+  content: "";
+  background: var(--chip);
+  opacity: 0;
+  z-index: -1;
+  border-radius: 8px;
+  transition: opacity 0.2s ease-out, transform 0.2s ease-out;
+  position: absolute;
+  inset: -6px -12px;
+  transform: scale(0.98);
+}
+.item:hover:before, .item:focus-visible:before {
+  opacity: 1;
+  transform: scale(1);
+}
+.item:hover .item-name {
+  text-decoration: underline;
+  text-decoration-color: var(--fg);
+  text-underline-offset: 3px;
+}
+.item:hover .item-arrow {
+  color: var(--fg);
+  transform: translate(2px, -2px);
+}
+.item-arrow {
+  transition: transform 0.15s, color 0.15s;
+  display: inline-block;
+}
+.metric {
+  color: var(--fg2);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+/* Dim list on hover */
+.dim-list {
+  transition: opacity 0.3s ease-in-out;
+}
+.dim-list:hover > * {
+  opacity: 0.55;
+}
+.dim-list:hover > *:hover {
+  opacity: 1;
+}
+.post {
+  color: var(--fg);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+.post:hover .post-title {
+  text-decoration: underline;
+  text-decoration-color: var(--fg);
+  text-underline-offset: 3px;
+}
+
+/* Pills */
+.pill {
+  color: var(--fg2);
+  text-decoration: none;
+  transition: border-color 0.15s, color 0.15s;
+}
+.pill:hover {
+  border-color: var(--fg);
+  color: var(--fg);
+}
+.pill-solid {
+  text-decoration: none;
+  transition: background-color 0.15s, color 0.15s;
+}
+.pill-solid:hover {
+  background: var(--chip-hover);
+}
+
+/* Theme Toggle */
+.theme-toggle {
+  appearance: none;
+  border: 1px solid var(--line);
+  cursor: pointer;
+  width: 34px;
+  height: 34px;
+  color: var(--muted);
+  background: transparent;
+  border-radius: 999px;
+  justify-content: center;
+  align-items: center;
+  transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+  display: inline-flex;
+}
+.theme-toggle:hover {
+  color: var(--fg);
+  border-color: var(--fg);
+}
+
+/* =========================================================================
+   View Transitions API for Circular Theme Ripple
+   ========================================================================= */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-image-pair(root) {
+  isolation: auto;
+}
+
+html.vt::view-transition-old(root),
+html.vt::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+/* Freeze CSS transitions while View Transition is running so colors don't tween during the clip-path wipe */
+html.vt,
+html.vt * {
+  transition: none !important;
+}
+
+/* Accessible fade fallback for users with prefers-reduced-motion */
+html.vt-fade::view-transition-old(root) {
+  animation: 0.28s both vt-fade-out;
+}
+html.vt-fade::view-transition-new(root) {
+  animation: 0.28s both vt-fade-in;
+}
+
+@keyframes vt-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes vt-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}

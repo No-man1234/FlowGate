@@ -1,4 +1,4 @@
-.PHONY: all build test bench clean run-upstream run-gateway benchmark
+.PHONY: all build test bench clean run-upstream run-gateway benchmark frontend-install frontend-dev frontend-build
 
 BINARY_DIR=bin
 GO=go
@@ -12,9 +12,21 @@ build:
 	$(GO) build -v -o $(BINARY_DIR)/upstream ./cmd/upstream
 	$(GO) build -v -o $(BINARY_DIR)/loadgen ./cmd/loadgen
 
+frontend-install:
+	@echo "Installing frontend dependencies..."
+	cd frontend && npm install
+
+frontend-dev:
+	@echo "Starting frontend dev server..."
+	cd frontend && npm run dev
+
+frontend-build:
+	@echo "Building frontend for production..."
+	cd frontend && npm run build
+
 test:
 	@echo "Running unit tests with race detector..."
-	$(GO) test -v -race -cover ./...
+	$(GO) test -v -race -cover ./cmd/... ./pkg/...
 
 bench:
 	@echo "Running performance microbenchmarks..."
