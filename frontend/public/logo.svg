@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <!-- FlowGate Variant 4: The Shield Conduit -->
+  <!-- Outer Shield Boundary: Heavy structural barrier -->
+  <path d="M 50 18 L 78 28 C 78 52 66 74 50 82 C 34 74 22 52 22 28 Z" stroke="currentColor" stroke-width="3.5" stroke-linejoin="round"/>
+  
+  <!-- Internal Flow Conduits -->
+  <path d="M 36 38 Q 50 48, 64 38" stroke="currentColor" stroke-width="2" stroke-linecap="round" opacity="0.6"/>
+  <line x1="50" y1="36" x2="50" y2="66" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+  
+  <!-- Priority Tier Nodes -->
+  <!-- Critical Node (Top Center) -->
+  <circle cx="50" cy="36" r="4.5" fill="currentColor"/>
+  <!-- Standard Nodes (Left & Right) -->
+  <circle cx="36" cy="38" r="3" fill="currentColor"/>
+  <circle cx="64" cy="38" r="3" fill="currentColor"/>
+  <!-- Base Gateway Apex (Fast-fail 429 Shed Point) -->
+  <circle cx="50" cy="66" r="3.5" fill="currentColor"/>
+</svg>

@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { useState, useEffect } from "react";
-import { Moon, Sun, ShieldCheck, Menu, X, ChevronRight } from "lucide-react";
-import { GithubIcon } from "./icons";
+import { Moon, Sun, Menu, X, ChevronRight } from "lucide-react";
+import { GithubIcon, FlowGateLogo } from "./icons";
 import { useThemeTransition } from "@/hooks/use-theme-transition";
 import { useNavigation, PAGES } from "./navigation-context";
 
@@ -41,7 +41,7 @@ export function FlowGateHeader() {
             className="flex items-center gap-2.5 font-semibold text-[17px] tracking-tight hover:no-underline cursor-pointer bg-transparent border-0 p-0 text-left"
           >
             <span className="w-8 h-8 rounded-lg bg-[var(--chip)] border border-[var(--line)] flex items-center justify-center text-emerald-600 dark:text-emerald-400 shrink-0">
-              <ShieldCheck className="w-4 h-4" />
+              <FlowGateLogo className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
             </span>
             <span className="text-[var(--fg)]">FlowGate</span>
           </button>

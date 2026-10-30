@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { ShieldCheck, Moon, Sun } from "lucide-react";
-import { GithubIcon } from "./icons";
+import { Moon, Sun } from "lucide-react";
+import { GithubIcon, FlowGateLogo } from "./icons";
 import { useThemeTransition } from "@/hooks/use-theme-transition";
 
 export function FlowGateFooter() {
@@ -11,7 +11,7 @@ export function FlowGateFooter() {
   return (
     <footer className="flex flex-wrap items-center justify-between gap-4 py-8 border-t border-[var(--line)] text-xs text-[var(--muted)]">
       <div className="flex items-center gap-2">
-        <ShieldCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+        <FlowGateLogo className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
         <span className="font-semibold text-[var(--fg)]">FlowGate</span>
         <span>— Released under the MIT License</span>
       </div>

@@ -1,3 +1,41 @@
+export function FlowGateLogo({ className = "w-5 h-5" }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 100 100"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M 50 18 L 78 28 C 78 52 66 74 50 82 C 34 74 22 52 22 28 Z"
+        stroke="currentColor"
+        strokeWidth="4"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M 36 38 Q 50 48, 64 38"
+        stroke="currentColor"
+        strokeWidth="2.5"
+        strokeLinecap="round"
+        opacity="0.6"
+      />
+      <line
+        x1="50"
+        y1="36"
+        x2="50"
+        y2="66"
+        stroke="currentColor"
+        strokeWidth="3"
+        strokeLinecap="round"
+      />
+      <circle cx="50" cy="36" r="5" fill="currentColor" />
+      <circle cx="36" cy="38" r="3.5" fill="currentColor" />
+      <circle cx="64" cy="38" r="3.5" fill="currentColor" />
+      <circle cx="50" cy="66" r="4" fill="currentColor" />
+    </svg>
+  );
+}
+
 export function GithubIcon({ className = "w-4 h-4" }: { className?: string }) {
   return (
     <svg
