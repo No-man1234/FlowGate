@@ -1,6 +1,16 @@
+import type { Metadata } from "next";
 import { FlowGateHeader } from "@/components/flowgate/header";
 import { FlowGateVisualizer } from "@/components/flowgate/visualizer";
 import { FlowGateFooter } from "@/components/flowgate/footer";
+
+export const metadata: Metadata = {
+  title: "Interactive Adaptive Concurrency Testbench",
+  description:
+    "Simulate real-time database brownouts, latency spikes, priority-tier shedding, and circuit breaker fast-fails in Go with FlowGate.",
+  alternates: {
+    canonical: "https://flowgate-fire.vercel.app/flowgate",
+  },
+};
 
 export default function FlowGatePage() {
   return (

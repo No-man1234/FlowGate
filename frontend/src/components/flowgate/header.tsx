@@ -46,6 +46,9 @@ export function FlowGateHeader() {
         <a href="#benchmarks" onClick={handleNavClick("benchmarks")} className="hover:text-[var(--fg)] hover:no-underline transition-colors cursor-pointer">
           Benchmarks
         </a>
+        <a href="#faq" onClick={handleNavClick("faq")} className="hover:text-[var(--fg)] hover:no-underline transition-colors cursor-pointer">
+          FAQ
+        </a>
         <a href="#quickstart" onClick={handleNavClick("quickstart")} className="hover:text-[var(--fg)] hover:no-underline transition-colors cursor-pointer">
           Quickstart
         </a>

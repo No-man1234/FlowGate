@@ -1,10 +1,11 @@
 # FlowGate 🛡️
 
 [![CI](https://github.com/No-man1234/FlowGate/actions/workflows/ci.yml/badge.svg)](https://github.com/No-man1234/FlowGate/actions)
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-flowgate--fire.vercel.app-10b981?style=flat&logo=vercel)](https://flowgate-fire.vercel.app)
 [![Go Version](https://img.shields.io/badge/go-1.23%2B-blue.svg)](https://golang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**FlowGate** is a high-concurrency, self-tuning resilient reverse proxy and API gateway written in Go.
+**FlowGate** is a high-concurrency, self-tuning resilient reverse proxy and API gateway written in Go. Experience the [Live Interactive Simulator](https://flowgate-fire.vercel.app).
 
 While enterprise service meshes like Envoy support adaptive concurrency via custom C++ filters, FlowGate is a lightweight, standalone, and embeddable Go implementation based on the gradient-limiting principles pioneered by **Netflix** (`concurrency-limits`) and **Envoy** (`adaptive_concurrency`).
 

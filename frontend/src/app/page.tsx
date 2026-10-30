@@ -5,6 +5,7 @@ import { ProblemComparison } from "@/components/flowgate/problem-comparison";
 import { HowItWorks } from "@/components/flowgate/how-it-works";
 import { FlowGateBenchmarks } from "@/components/flowgate/benchmarks";
 import { FlowGateQuickstart } from "@/components/flowgate/quickstart";
+import { FlowGateFAQ } from "@/components/flowgate/faq";
 import { FlowGateFooter } from "@/components/flowgate/footer";
 
 export default function Home() {
@@ -17,6 +18,7 @@ export default function Home() {
         <ProblemComparison />
         <HowItWorks />
         <FlowGateBenchmarks />
+        <FlowGateFAQ />
         <FlowGateQuickstart />
       </main>
       <FlowGateFooter />
