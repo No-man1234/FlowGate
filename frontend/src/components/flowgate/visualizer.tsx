@@ -72,14 +72,8 @@ export function FlowGateVisualizer() {
   // History for charts
   const [history, setHistory] = useState<TelemetryPoint[]>([]);
   const [logs, setLogs] = useState<RequestLog[]>([]);
-  const [isStreamPaused, setIsStreamPaused] = useState<boolean>(false);
-  const isStreamPausedRef = useRef<boolean>(false);
   const logContainerRef = useRef<HTMLDivElement>(null);
   const touchStartY = useRef<number | null>(null);
-
-  useEffect(() => {
-    isStreamPausedRef.current = isStreamPaused;
-  }, [isStreamPaused]);
 
   // Simulation animation frame ref
   const animRef = useRef<number | null>(null);
@@ -351,7 +345,7 @@ export function FlowGateVisualizer() {
         return next.slice(-40);
       });
 
-      if (batchLogs.length > 0 && !isStreamPausedRef.current) {
+      if (batchLogs.length > 0) {
         setLogs((prev) => [...batchLogs, ...prev].slice(0, 50));
       }
 
@@ -905,47 +899,11 @@ export function FlowGateVisualizer() {
       {/* Real-Time Request Inspector Log */}
       <div className="p-4 sm:p-5 rounded-2xl border border-[var(--line)] bg-[var(--bg)] flex flex-col gap-3">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-[var(--line)] pb-3">
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex items-center gap-2.5">
             <h3 className="text-xs uppercase tracking-wider font-semibold text-[var(--muted)] flex items-center gap-2">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  isStreamPaused ? "bg-amber-500" : "bg-emerald-500 animate-pulse"
-                }`}
-              />
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
               Live Request Stream (Gateway Decisions)
             </h3>
-            <button
-              type="button"
-              onClick={() => {
-                if (isStreamPaused) {
-                  setIsStreamPaused(false);
-                  if (logContainerRef.current) {
-                    logContainerRef.current.scrollTop = 0;
-                  }
-                } else {
-                  setIsStreamPaused(true);
-                }
-              }}
-              className="text-[11px] font-mono px-2.5 py-0.5 rounded border border-[var(--line)] bg-[var(--chip)] text-[var(--fg2)] hover:bg-[var(--chip-hover)] transition-colors flex items-center gap-1.5 shadow-sm"
-              title={isStreamPaused ? "Resume live streaming" : "Pause live streaming to inspect logs"}
-            >
-              {isStreamPaused ? (
-                <>
-                  <Play className="w-2.5 h-2.5 text-emerald-500 fill-emerald-500" />
-                  <span className="font-semibold text-emerald-600 dark:text-emerald-400">Resume Stream</span>
-                </>
-              ) : (
-                <>
-                  <Square className="w-2.5 h-2.5 text-amber-500 fill-amber-500" />
-                  <span>Pause Stream</span>
-                </>
-              )}
-            </button>
-            {isStreamPaused && (
-              <span className="text-[11px] text-amber-600 dark:text-amber-400 font-mono hidden sm:inline-block">
-                (Paused for inspection)
-              </span>
-            )}
             {logs.length > 0 && (
               <button
                 type="button"
@@ -976,47 +934,17 @@ export function FlowGateVisualizer() {
         <div
           ref={logContainerRef}
           style={{ overflowAnchor: "none" }}
-          onScroll={() => {
-            const el = logContainerRef.current;
-            if (!el) return;
-            // If the user manually scrolls down the scrollbar to inspect history, auto-pause the stream!
-            if (el.scrollTop > 15 && !isStreamPausedRef.current) {
-              setIsStreamPaused(true);
-            }
-          }}
           onWheel={(e) => {
-            const el = logContainerRef.current;
-            if (!el) return;
-            if (!isStreamPaused) {
-              // When live streaming, keep stream pinned to latest and let user scroll webpage freely!
-              window.scrollBy({ top: e.deltaY, behavior: "auto" });
-            } else {
-              // When paused, allow internal inspecting of log history with boundary pass-through
-              if (e.deltaY < 0 && el.scrollTop <= 2) {
-                window.scrollBy({ top: e.deltaY, behavior: "auto" });
-              } else if (e.deltaY > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 2) {
-                window.scrollBy({ top: e.deltaY, behavior: "auto" });
-              }
-            }
+            window.scrollBy({ top: e.deltaY, behavior: "auto" });
           }}
           onTouchStart={(e) => {
             touchStartY.current = e.touches[0].clientY;
           }}
           onTouchMove={(e) => {
-            const el = logContainerRef.current;
-            if (!el || touchStartY.current === null) return;
+            if (touchStartY.current === null) return;
             const currentY = e.touches[0].clientY;
-            const deltaY = touchStartY.current - currentY; // positive = scroll down, negative = scroll up
-
-            if (!isStreamPaused) {
-              window.scrollBy({ top: deltaY, behavior: "auto" });
-            } else {
-              if (deltaY < 0 && el.scrollTop <= 2) {
-                window.scrollBy({ top: deltaY, behavior: "auto" });
-              } else if (deltaY > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 2) {
-                window.scrollBy({ top: deltaY, behavior: "auto" });
-              }
-            }
+            const deltaY = touchStartY.current - currentY;
+            window.scrollBy({ top: deltaY, behavior: "auto" });
             touchStartY.current = currentY;
           }}
           onTouchEnd={() => {
