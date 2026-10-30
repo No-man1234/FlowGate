@@ -36,4 +36,6 @@ frontend/build/
 frontend/*.tsbuildinfo
 frontend/next-env.d.ts
 frontend/.vercel/
+brag-output/
+
 

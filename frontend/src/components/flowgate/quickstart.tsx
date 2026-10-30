@@ -52,7 +52,7 @@ func main() {
 }`;
 
   return (
-    <section id="quickstart" className="flex flex-col gap-8 py-12 border-b border-[var(--line)] scroll-mt-8">
+    <section id="quickstart" className="flex flex-col gap-8 py-8 md:py-12 scroll-mt-8">
       <div className="flex flex-col gap-2 max-w-2xl">
         <span className="text-xs uppercase tracking-wider font-semibold text-emerald-600 dark:text-emerald-400 font-mono">
           Developer Quickstart

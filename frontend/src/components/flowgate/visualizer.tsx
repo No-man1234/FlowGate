@@ -379,7 +379,7 @@ export function FlowGateVisualizer() {
     .join(" ");
 
   return (
-    <section id="testbench" className="flex flex-col gap-8 py-12 border-b border-[var(--line)] scroll-mt-8">
+    <section id="testbench" className="flex flex-col gap-8 py-8 md:py-12 scroll-mt-8">
       {/* Header of Testbench */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-col gap-1">
