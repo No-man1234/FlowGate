@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { Moon, Sun, ShieldCheck } from "lucide-react";
+import { useState, useEffect } from "react";
+import { Moon, Sun, ShieldCheck, Menu, X, ChevronRight } from "lucide-react";
 import { GithubIcon } from "./icons";
 import { useThemeTransition } from "@/hooks/use-theme-transition";
 import { useNavigation, PAGES } from "./navigation-context";
@@ -9,17 +10,30 @@ import { useNavigation, PAGES } from "./navigation-context";
 export function FlowGateHeader() {
   const { isDark, toggleTheme } = useThemeTransition();
   const { activePage, setActivePage } = useNavigation();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  // Close mobile menu on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && mobileMenuOpen) {
+        setMobileMenuOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [mobileMenuOpen]);
 
   const handleBrandClick = (e: React.MouseEvent) => {
     e.preventDefault();
     setActivePage("overview");
+    setMobileMenuOpen(false);
   };
 
   return (
     <header className="site-header flex flex-col border-b border-[var(--line)]">
       {/* Top Bar: Brand, Desktop Nav, Actions */}
-      <div className="flex items-center justify-between gap-4 py-4">
-        {/* Brand */}
+      <div className="flex items-center justify-between gap-3 py-3.5 md:py-4">
+        {/* Brand without version tag */}
         <div className="flex items-center gap-3 shrink-0">
           <button
             type="button"
@@ -30,16 +44,13 @@ export function FlowGateHeader() {
               <ShieldCheck className="w-4 h-4" />
             </span>
             <span className="text-[var(--fg)]">FlowGate</span>
-            <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
-              v1.0.0
-            </span>
           </button>
         </div>
 
-        {/* Desktop Navigation */}
+        {/* Desktop Navigation - strictly single-line, zero double-line buttons */}
         <nav
           aria-label="Main Navigation"
-          className="hidden lg:flex items-center gap-1 text-[13px] text-[var(--muted)]"
+          className="hidden lg:flex items-center gap-1.5 text-[13px] text-[var(--muted)]"
         >
           {PAGES.map((page) => {
             const isActive = activePage === page.id;
@@ -48,7 +59,7 @@ export function FlowGateHeader() {
                 key={page.id}
                 type="button"
                 onClick={() => setActivePage(page.id)}
-                className={`relative px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
+                className={`whitespace-nowrap shrink-0 px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${
                   isActive
                     ? "bg-[var(--chip)] text-[var(--fg)] font-semibold border border-[var(--line)] shadow-xs"
                     : "text-[var(--muted)] hover:text-[var(--fg)] hover:bg-[var(--chip)]/60"
@@ -57,10 +68,10 @@ export function FlowGateHeader() {
                 {isActive && (
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
                 )}
-                <span>{page.label}</span>
+                <span className="whitespace-nowrap">{page.shortLabel}</span>
                 {page.badge && (
                   <span
-                    className={`text-[9px] font-mono px-1 py-0.2 rounded-full border ${
+                    className={`text-[9px] font-mono px-1.5 py-0.2 rounded-full border whitespace-nowrap ${
                       isActive
                         ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30"
                         : "bg-[var(--line)] text-[var(--faint)] border-[var(--line)]"
@@ -74,8 +85,8 @@ export function FlowGateHeader() {
           })}
         </nav>
 
-        {/* Action / GitHub / Theme */}
-        <div className="flex items-center gap-2.5 shrink-0">
+        {/* Actions & Mobile Menu Toggle */}
+        <div className="flex items-center gap-2 shrink-0">
           <Link
             href="https://github.com/No-man1234/FlowGate"
             target="_blank"
@@ -99,38 +110,96 @@ export function FlowGateHeader() {
               <Moon className="w-3.5 h-3.5" />
             )}
           </button>
+
+          {/* Smartphone / Mobile Menu Toggle Button */}
+          <button
+            type="button"
+            aria-label={mobileMenuOpen ? "Close navigation menu" : "Open navigation menu"}
+            aria-expanded={mobileMenuOpen}
+            onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+            className="lg:hidden p-2 rounded-lg bg-[var(--chip)] text-[var(--fg)] border border-[var(--line)] hover:border-[var(--fg)] transition-all cursor-pointer flex items-center justify-center"
+          >
+            {mobileMenuOpen ? (
+              <X className="w-4 h-4 text-[var(--fg)]" />
+            ) : (
+              <Menu className="w-4 h-4 text-[var(--fg)]" />
+            )}
+          </button>
         </div>
       </div>
 
-      {/* Sub Navigation Bar for tablet and mobile (< lg) */}
-      <nav
-        aria-label="Mobile Navigation"
-        className="flex lg:hidden items-center gap-1.5 overflow-x-auto py-2.5 no-scrollbar -mx-4 px-4 border-t border-[var(--line)]"
-      >
-        {PAGES.map((page) => {
-          const isActive = activePage === page.id;
-          return (
-            <button
-              key={page.id}
-              type="button"
-              onClick={() => setActivePage(page.id)}
-              className={`whitespace-nowrap px-3 py-1 rounded-full text-xs font-medium transition-all shrink-0 cursor-pointer flex items-center gap-1.5 ${
-                isActive
-                  ? "bg-[var(--fg)] text-[var(--bg)] font-semibold shadow-xs"
-                  : "bg-[var(--chip)] text-[var(--muted)] hover:text-[var(--fg)] border border-[var(--line)]"
-              }`}
-            >
-              {isActive && (
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
-              )}
-              <span>{page.shortLabel}</span>
-              {page.badge && (
-                <span className="text-[9px] opacity-80">({page.badge})</span>
-              )}
-            </button>
-          );
-        })}
-      </nav>
+      {/* Smartphone / Tablet Responsive Drawer Menu (< lg) */}
+      {mobileMenuOpen && (
+        <nav
+          aria-label="Mobile Navigation"
+          className="lg:hidden flex flex-col gap-1.5 py-3 border-t border-[var(--line)] animate-page-in"
+        >
+          <div className="flex items-center justify-between px-2 pb-1 text-[11px] font-mono uppercase tracking-wider text-[var(--faint)]">
+            <span>Navigation Chapters</span>
+            <span>Tap to jump</span>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            {PAGES.map((page, index) => {
+              const isActive = activePage === page.id;
+              return (
+                <button
+                  key={page.id}
+                  type="button"
+                  onClick={() => {
+                    setActivePage(page.id);
+                    setMobileMenuOpen(false);
+                  }}
+                  className={`flex items-center justify-between p-3 rounded-xl text-left transition-all cursor-pointer ${
+                    isActive
+                      ? "bg-[var(--chip)] text-[var(--fg)] font-semibold border border-[var(--line)] shadow-xs"
+                      : "text-[var(--muted)] hover:text-[var(--fg)] hover:bg-[var(--chip)]/60"
+                  }`}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span
+                      className={`w-6 h-6 rounded-lg text-xs font-mono flex items-center justify-center shrink-0 ${
+                        isActive
+                          ? "bg-emerald-500 text-white font-bold"
+                          : "bg-[var(--bg)] border border-[var(--line)] text-[var(--faint)]"
+                      }`}
+                    >
+                      {index + 1}
+                    </span>
+                    <div className="flex flex-col min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-[var(--fg)] truncate">
+                          {page.label}
+                        </span>
+                        {page.badge && (
+                          <span
+                            className={`text-[9px] font-mono px-1.5 py-0.2 rounded-full border ${
+                              isActive
+                                ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30"
+                                : "bg-[var(--line)] text-[var(--faint)] border-[var(--line)]"
+                            }`}
+                          >
+                            {page.badge}
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[11px] text-[var(--muted)] truncate">
+                        {page.description}
+                      </span>
+                    </div>
+                  </div>
+
+                  <ChevronRight
+                    className={`w-4 h-4 shrink-0 transition-transform ${
+                      isActive ? "text-emerald-500 translate-x-0.5" : "text-[var(--faint)]"
+                    }`}
+                  />
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+      )}
     </header>
   );
 }
