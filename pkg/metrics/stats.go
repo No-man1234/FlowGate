@@ -84,6 +84,13 @@ type Summary struct {
 // ServeHTTP handles the /metrics JSON endpoint.
 func (c *Collector) Handler(getSnapshot func() Summary) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		snap := getSnapshot()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(snap)

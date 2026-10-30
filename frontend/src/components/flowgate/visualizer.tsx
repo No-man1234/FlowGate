@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -11,6 +11,9 @@ import {
   RotateCcw,
   Shield,
   Square,
+  Terminal,
+  Wifi,
+  WifiOff,
   Zap,
 } from "lucide-react";
 
@@ -35,9 +38,13 @@ interface RequestLog {
 type BreakerState = "CLOSED" | "OPEN" | "HALF_OPEN";
 
 export function FlowGateVisualizer() {
-  // Mode selection
+  // Mode selection: virtual simulation vs live gateway
   const [mode, setMode] = useState<"simulator" | "live">("simulator");
+  const [liveConnected, setLiveConnected] = useState<boolean>(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
+
   const [isRunning, setIsRunning] = useState<boolean>(false);
+  const [activePreset, setActivePreset] = useState<string | null>(null);
 
   // Knobs & Settings
   const [concurrency, setConcurrency] = useState<number>(35); // Workers
@@ -46,15 +53,16 @@ export function FlowGateVisualizer() {
   const [criticalPct, setCriticalPct] = useState<number>(20);
   const [bestEffortPct, setBestEffortPct] = useState<number>(25);
 
-  // Gateway Internal State (Simulated FlowGate Engine)
+  // Gateway Internal State (Simulated / Live)
   const [limit, setLimit] = useState<number>(30);
   const [inFlight, setInFlight] = useState<number>(0);
   const [minRtt, setMinRtt] = useState<number>(30);
+  const [sampleRtt, setSampleRtt] = useState<number>(30);
   const [breakerState, setBreakerState] = useState<BreakerState>("CLOSED");
   const [breakerFailures, setBreakerFailures] = useState<number>(0);
   const [breakerCooldown, setBreakerCooldown] = useState<number>(0);
 
-  // Counters
+  // Stats Counters
   const [stats, setStats] = useState({
     total: 0,
     ok200: 0,
@@ -72,18 +80,18 @@ export function FlowGateVisualizer() {
   // History for charts
   const [history, setHistory] = useState<TelemetryPoint[]>([]);
   const [logs, setLogs] = useState<RequestLog[]>([]);
-  const logContainerRef = useRef<HTMLDivElement>(null);
-  const touchStartY = useRef<number | null>(null);
 
-  // Simulation animation frame ref
+  // Refs for animation loop and timeouts
   const animRef = useRef<number | null>(null);
   const breakerTripTimeRef = useRef<number>(0);
+  const pendingTimeoutsRef = useRef<Set<NodeJS.Timeout>>(new Set());
 
-  // State refs to avoid stale closures in the loop
+  // Mutable state ref to prevent stale closures in requestAnimationFrame
   const stateRef = useRef({
     limit: 30,
     inFlight: 0,
     minRtt: 30,
+    sampleRtt: 30,
     breakerState: "CLOSED" as BreakerState,
     breakerFailures: 0,
     stats: { ...stats },
@@ -95,6 +103,7 @@ export function FlowGateVisualizer() {
     isRunning,
   });
 
+  // Keep stateRef synced with latest component state
   useEffect(() => {
     stateRef.current.concurrency = concurrency;
     stateRef.current.upstreamBaseRtt = upstreamBaseRtt;
@@ -104,18 +113,22 @@ export function FlowGateVisualizer() {
     stateRef.current.isRunning = isRunning;
   }, [concurrency, upstreamBaseRtt, upstreamErrorRate, criticalPct, bestEffortPct, isRunning]);
 
-  // Apply scenario presets
+  // Apply scenario presets and auto-start
   const applyPreset = (preset: "normal" | "burst" | "latency" | "outage") => {
+    setActivePreset(preset);
     if (preset === "normal") {
       setConcurrency(25);
       setUpstreamBaseRtt(25);
       setUpstreamErrorRate(0);
       setLimit(30);
       setMinRtt(25);
+      setSampleRtt(25);
       setBreakerState("CLOSED");
       setBreakerFailures(0);
+      setBreakerCooldown(0);
       stateRef.current.limit = 30;
       stateRef.current.minRtt = 25;
+      stateRef.current.sampleRtt = 25;
       stateRef.current.breakerState = "CLOSED";
       stateRef.current.breakerFailures = 0;
     } else if (preset === "burst") {
@@ -128,20 +141,34 @@ export function FlowGateVisualizer() {
       setUpstreamErrorRate(0);
     } else if (preset === "outage") {
       setUpstreamErrorRate(100);
-      setConcurrency(20);
+      setConcurrency(25);
+    }
+
+    // Auto-start simulation if in simulator mode
+    if (mode === "simulator") {
+      setIsRunning(true);
     }
   };
 
-  const resetAll = () => {
+  // Full reset of state and pending requests
+  const resetAll = useCallback(() => {
     setIsRunning(false);
+    setActivePreset(null);
+
+    // Cancel all in-flight request completions
+    pendingTimeoutsRef.current.forEach((t) => clearTimeout(t));
+    pendingTimeoutsRef.current.clear();
+
     setLimit(30);
     setInFlight(0);
     setMinRtt(25);
+    setSampleRtt(25);
     setBreakerState("CLOSED");
     setBreakerFailures(0);
     setBreakerCooldown(0);
     setHistory([]);
     setLogs([]);
+
     const freshStats = {
       total: 0,
       ok200: 0,
@@ -156,93 +183,271 @@ export function FlowGateVisualizer() {
       bestEffortShed: 0,
     };
     setStats(freshStats);
+
     stateRef.current.limit = 30;
     stateRef.current.inFlight = 0;
     stateRef.current.minRtt = 25;
+    stateRef.current.sampleRtt = 25;
     stateRef.current.breakerState = "CLOSED";
     stateRef.current.breakerFailures = 0;
     stateRef.current.stats = freshStats;
-  };
+  }, []);
 
+  // Live Gateway polling effect (localhost:8080/metrics)
   useEffect(() => {
-    if (!isRunning) {
+    if (mode !== "live") return;
+
+    let isMounted = true;
+    const fetchLiveMetrics = async () => {
+      try {
+        const res = await fetch("http://127.0.0.1:8080/metrics", {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          cache: "no-store",
+        });
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        const data = await res.json();
+        if (!isMounted) return;
+
+        setLiveConnected(true);
+        setLiveError(null);
+
+        // Map live Go gateway metrics to visualizer state
+        const currentLimitVal = data.current_limit ?? 50;
+        const inFlightVal = data.in_flight ?? 0;
+        const minRttVal = data.min_rtt_ms ?? 15;
+        const sampleRttVal = data.sample_rtt_ms ?? 20;
+        const circuitStateVal = (data.circuit_state?.toUpperCase() ?? "CLOSED") as BreakerState;
+
+        setLimit(currentLimitVal);
+        setInFlight(inFlightVal);
+        setMinRtt(minRttVal);
+        setSampleRtt(sampleRttVal);
+        setBreakerState(circuitStateVal);
+
+        setStats((prev) => ({
+          ...prev,
+          total: data.total_requests ?? prev.total,
+          ok200: data.accepted_requests ?? prev.ok200,
+          shed429: data.shed_requests ?? prev.shed429,
+          breaker503: data.circuit_breaker_trips ?? prev.breaker503,
+          error502: data.upstream_errors ?? prev.error502,
+        }));
+
+        setHistory((prev) => {
+          const point: TelemetryPoint = {
+            time: Date.now(),
+            limit: Math.round(currentLimitVal * 10) / 10,
+            inFlight: inFlightVal,
+            rtt: Math.round(sampleRttVal),
+          };
+          return [...prev, point].slice(-40);
+        });
+      } catch (err) {
+        if (!isMounted) return;
+        setLiveConnected(false);
+        setLiveError("Cannot connect to FlowGate on 127.0.0.1:8080. Ensure the binary is running.");
+      }
+    };
+
+    fetchLiveMetrics();
+    const interval = setInterval(fetchLiveMetrics, 1000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [mode]);
+
+  // Virtual Simulator animation loop
+  useEffect(() => {
+    if (mode !== "simulator" || !isRunning) {
       if (animRef.current) cancelAnimationFrame(animRef.current);
       return;
     }
 
     let lastTime = Date.now();
+    let accumulator = 0;
 
     const tick = () => {
       const now = Date.now();
-      const dt = now - lastTime;
+      const dt = Math.min(100, now - lastTime);
       lastTime = now;
+      accumulator += dt;
 
       const s = stateRef.current;
 
-      // 1. Circuit breaker cool-off progression
+      // 1. Circuit breaker cool-off progression in OPEN state
       if (s.breakerState === "OPEN") {
         const elapsed = (now - breakerTripTimeRef.current) / 1000;
         const remaining = Math.max(0, 5 - elapsed);
         setBreakerCooldown(remaining);
         if (remaining <= 0) {
           s.breakerState = "HALF_OPEN";
+          s.breakerFailures = 0;
           setBreakerState("HALF_OPEN");
+          setBreakerFailures(0);
         }
       }
 
-      // 2. Dispatch simulated incoming requests according to concurrency target
-      const newArrivals = Math.max(1, Math.floor((s.concurrency / 10) * (dt / 50)));
-      const batchLogs: RequestLog[] = [];
+      // Generate request pulses based on concurrency workers (target: ~2 requests per worker per second)
+      const intervalMs = Math.max(25, 1000 / Math.max(1, s.concurrency * 1.5));
+      if (accumulator >= intervalMs) {
+        accumulator = 0;
 
-      for (let i = 0; i < newArrivals; i++) {
-        s.stats.total++;
+        const batchLogs: RequestLog[] = [];
+        const arrivals = Math.max(1, Math.round(s.concurrency / 25));
 
-        // Pick priority
-        const randPrio = Math.random() * 100;
-        let prio: "critical" | "standard" | "best_effort" = "standard";
-        let path = "/api/v1/orders";
+        for (let i = 0; i < arrivals; i++) {
+          s.stats.total++;
 
-        if (randPrio < s.criticalPct) {
-          prio = "critical";
-          path = "/checkout";
-        } else if (randPrio > 100 - s.bestEffortPct) {
-          prio = "best_effort";
-          path = "/analytics/track";
-        }
+          // Select priority tier
+          const randPrio = Math.random() * 100;
+          let prio: "critical" | "standard" | "best_effort" = "standard";
+          let path = "/api/v1/orders";
 
-        // Step 1: Circuit breaker check
-        if (s.breakerState === "OPEN") {
-          s.stats.breaker503++;
-          batchLogs.push({
-            id: Math.random().toString(36).substring(2, 8),
-            time: new Date().toLocaleTimeString(),
-            method: "GET",
-            path,
-            priority: prio,
-            status: 503,
-            latencyMs: 0.05,
-            reason: "Circuit Breaker OPEN (Upstream failure protection)",
-          });
-          continue;
-        }
+          if (randPrio < s.criticalPct) {
+            prio = "critical";
+            path = "/checkout";
+          } else if (randPrio > 100 - s.bestEffortPct) {
+            prio = "best_effort";
+            path = "/analytics/track";
+          }
 
-        // Step 2: Adaptive Concurrency limiter check (Gradient formula)
-        let admit = false;
-        const capacityRatio = s.inFlight / Math.max(1, s.limit);
+          // Step 1: Circuit breaker check
+          if (s.breakerState === "OPEN") {
+            s.stats.breaker503++;
+            batchLogs.push({
+              id: Math.random().toString(36).substring(2, 8),
+              time: new Date().toLocaleTimeString(),
+              method: "GET",
+              path,
+              priority: prio,
+              status: 503,
+              latencyMs: 0.05,
+              reason: "Circuit Breaker OPEN (Upstream failure protection)",
+            });
+            continue;
+          }
 
-        if (prio === "critical") {
-          admit = s.inFlight < s.limit * 1.2;
-        } else if (prio === "standard") {
-          admit = capacityRatio < 0.95;
-        } else {
-          admit = capacityRatio < 0.75;
-        }
+          // Step 2: Adaptive Concurrency limiter check (Gradient formula)
+          let admit = false;
+          const capacityRatio = s.inFlight / Math.max(1, s.limit);
 
-        if (!admit) {
-          s.stats.shed429++;
-          if (prio === "critical") s.stats.criticalShed++;
-          else if (prio === "standard") s.stats.standardShed++;
-          else s.stats.bestEffortShed++;
+          if (prio === "critical") {
+            admit = s.inFlight < s.limit * 1.2;
+          } else if (prio === "standard") {
+            admit = capacityRatio < 0.85;
+          } else {
+            admit = capacityRatio < 0.70;
+          }
+
+          if (!admit) {
+            s.stats.shed429++;
+            if (prio === "critical") s.stats.criticalShed++;
+            else if (prio === "standard") s.stats.standardShed++;
+            else s.stats.bestEffortShed++;
+
+            batchLogs.push({
+              id: Math.random().toString(36).substring(2, 8),
+              time: new Date().toLocaleTimeString(),
+              method: "POST",
+              path,
+              priority: prio,
+              status: 429,
+              latencyMs: 0.1,
+              reason: `Adaptive load shed (${Math.round(capacityRatio * 100)}% capacity)`,
+            });
+            continue;
+          }
+
+          // Request admitted!
+          if (prio === "critical") s.stats.criticalAdmitted++;
+          else if (prio === "standard") s.stats.standardAdmitted++;
+          else s.stats.bestEffortAdmitted++;
+
+          s.inFlight++;
+
+          // Upstream completion simulation
+          const isUpstreamError = Math.random() * 100 < s.upstreamErrorRate;
+          const jitter = (Math.random() - 0.5) * 8;
+          const queuePenalty = Math.max(0, (s.inFlight - s.limit * 0.7) * 3);
+          const measuredRtt = Math.max(8, s.upstreamBaseRtt + jitter + queuePenalty);
+
+          // Simulated response delay (scaled for smooth browser visualization)
+          const timeoutDuration = Math.min(500, Math.max(40, measuredRtt * 2.5));
+
+          const timeoutId = setTimeout(() => {
+            pendingTimeoutsRef.current.delete(timeoutId);
+
+            stateRef.current.inFlight = Math.max(0, stateRef.current.inFlight - 1);
+            setInFlight(stateRef.current.inFlight);
+
+            if (isUpstreamError) {
+              stateRef.current.stats.error502++;
+              stateRef.current.breakerFailures++;
+              setBreakerFailures(stateRef.current.breakerFailures);
+
+              // Multiplicative limit backoff on upstream error (0.8x)
+              stateRef.current.limit = Math.max(5, stateRef.current.limit * 0.8);
+              setLimit(stateRef.current.limit);
+
+              if (stateRef.current.breakerFailures >= 4) {
+                stateRef.current.breakerState = "OPEN";
+                setBreakerState("OPEN");
+                breakerTripTimeRef.current = Date.now();
+                setBreakerCooldown(5);
+              }
+            } else {
+              stateRef.current.stats.ok200++;
+
+              if (stateRef.current.breakerState === "HALF_OPEN") {
+                stateRef.current.breakerState = "CLOSED";
+                stateRef.current.breakerFailures = 0;
+                setBreakerState("CLOSED");
+                setBreakerFailures(0);
+              }
+
+              // Update minRTT baseline
+              if (s.minRtt === 0 || measuredRtt < s.minRtt) {
+                stateRef.current.minRtt = measuredRtt;
+                setMinRtt(measuredRtt);
+              }
+
+              // EWMA smoothed sample RTT
+              const alpha = 0.2;
+              const smoothedSample = stateRef.current.sampleRtt * (1.0 - alpha) + measuredRtt * alpha;
+              stateRef.current.sampleRtt = smoothedSample;
+              setSampleRtt(smoothedSample);
+
+              // APP-LIMITED GUARD (Matches Go backend pkg/limiter/gradient.go):
+              // Only adjust limit upward when system is sufficiently loaded (inFlight >= 45% limit).
+              // When idle or uncongested, prevent false limit inflation.
+              const currentLoad = stateRef.current.inFlight;
+              const oldLimit = stateRef.current.limit;
+
+              if (currentLoad >= oldLimit * 0.45) {
+                const rawGradient = (stateRef.current.minRtt / smoothedSample) * 1.25;
+                const gradient = Math.max(0.5, Math.min(1.0, rawGradient));
+
+                // Incremental probe factor: scaled per completion to avoid runaway inflation
+                const headroomProbe = gradient >= 1.0 ? Math.sqrt(oldLimit) / oldLimit : 0;
+                const targetLimit = oldLimit * gradient + headroomProbe;
+
+                const smoothedLimit = oldLimit * 0.9 + targetLimit * 0.1;
+                const clampedLimit = Math.max(5, Math.min(150, smoothedLimit));
+
+                stateRef.current.limit = clampedLimit;
+                setLimit(clampedLimit);
+              }
+            }
+          }, timeoutDuration);
+
+          pendingTimeoutsRef.current.add(timeoutId);
 
           batchLogs.push({
             id: Math.random().toString(36).substring(2, 8),
@@ -250,103 +455,30 @@ export function FlowGateVisualizer() {
             method: "POST",
             path,
             priority: prio,
-            status: 429,
-            latencyMs: 0.1,
-            reason: `Adaptive load shed (${Math.round(capacityRatio * 100)}% capacity)`,
+            status: isUpstreamError ? 502 : 200,
+            latencyMs: Math.round(measuredRtt),
+            reason: isUpstreamError
+              ? "Upstream 502 failure"
+              : "Admitted by FlowGate limiter",
           });
-          continue;
         }
 
-        // Request admitted!
-        if (prio === "critical") s.stats.criticalAdmitted++;
-        else if (prio === "standard") s.stats.standardAdmitted++;
-        else s.stats.bestEffortAdmitted++;
+        setStats({ ...s.stats });
+        setInFlight(s.inFlight);
 
-        s.inFlight++;
-
-        // Upstream completion simulation
-        const isUpstreamError = Math.random() * 100 < s.upstreamErrorRate;
-        const jitter = (Math.random() - 0.5) * 15;
-        const queuePenalty = Math.max(0, (s.inFlight - s.limit * 0.7) * 4);
-        const measuredRtt = Math.max(5, s.upstreamBaseRtt + jitter + queuePenalty);
-
-        setTimeout(() => {
-          stateRef.current.inFlight = Math.max(0, stateRef.current.inFlight - 1);
-          setInFlight(stateRef.current.inFlight);
-
-          if (isUpstreamError) {
-            stateRef.current.stats.error502++;
-            stateRef.current.breakerFailures++;
-            setBreakerFailures(stateRef.current.breakerFailures);
-
-            stateRef.current.limit = Math.max(5, stateRef.current.limit * 0.85);
-            setLimit(stateRef.current.limit);
-
-            if (stateRef.current.breakerFailures >= 4) {
-              stateRef.current.breakerState = "OPEN";
-              setBreakerState("OPEN");
-              breakerTripTimeRef.current = Date.now();
-              setBreakerCooldown(5);
-            }
-          } else {
-            stateRef.current.stats.ok200++;
-
-            if (stateRef.current.breakerState === "HALF_OPEN") {
-              stateRef.current.breakerState = "CLOSED";
-              stateRef.current.breakerFailures = 0;
-              setBreakerState("CLOSED");
-              setBreakerFailures(0);
-            }
-
-            if (s.minRtt === 0 || measuredRtt < s.minRtt) {
-              stateRef.current.minRtt = measuredRtt;
-              setMinRtt(measuredRtt);
-            }
-
-            const rawGradient = (stateRef.current.minRtt * 1.25) / measuredRtt;
-            const gradient = Math.max(0.5, Math.min(1.0, rawGradient));
-            const oldLimit = stateRef.current.limit;
-            const queueAllowance = Math.sqrt(oldLimit);
-
-            const calculatedLimit = oldLimit * gradient + queueAllowance;
-            const smoothedLimit = oldLimit * 0.8 + calculatedLimit * 0.2;
-            const clampedLimit = Math.max(5, Math.min(250, smoothedLimit));
-
-            stateRef.current.limit = clampedLimit;
-            setLimit(clampedLimit);
-          }
-        }, Math.min(600, measuredRtt * 4));
-
-        batchLogs.push({
-          id: Math.random().toString(36).substring(2, 8),
-          time: new Date().toLocaleTimeString(),
-          method: "POST",
-          path,
-          priority: prio,
-          status: isUpstreamError ? 502 : 200,
-          latencyMs: Math.round(measuredRtt),
-          reason: isUpstreamError
-            ? "Upstream 502 failure"
-            : "Admitted by FlowGate limiter",
+        setHistory((prev) => {
+          const point: TelemetryPoint = {
+            time: now,
+            limit: Math.round(s.limit * 10) / 10,
+            inFlight: s.inFlight,
+            rtt: Math.round(s.sampleRtt),
+          };
+          return [...prev, point].slice(-40);
         });
-      }
 
-      setStats({ ...s.stats });
-      setInFlight(s.inFlight);
-
-      setHistory((prev) => {
-        const point: TelemetryPoint = {
-          time: now,
-          limit: Math.round(s.limit * 10) / 10,
-          inFlight: s.inFlight,
-          rtt: Math.round(s.upstreamBaseRtt),
-        };
-        const next = [...prev, point];
-        return next.slice(-40);
-      });
-
-      if (batchLogs.length > 0) {
-        setLogs((prev) => [...batchLogs, ...prev].slice(0, 50));
+        if (batchLogs.length > 0) {
+          setLogs((prev) => [...batchLogs, ...prev].slice(0, 50));
+        }
       }
 
       animRef.current = requestAnimationFrame(tick);
@@ -356,8 +488,17 @@ export function FlowGateVisualizer() {
     return () => {
       if (animRef.current) cancelAnimationFrame(animRef.current);
     };
-  }, [isRunning]);
+  }, [isRunning, mode]);
 
+  // Clean up timeouts on unmount
+  useEffect(() => {
+    return () => {
+      pendingTimeoutsRef.current.forEach((t) => clearTimeout(t));
+      pendingTimeoutsRef.current.clear();
+    };
+  }, []);
+
+  // Chart coordinate calculations
   const maxChartLimit = Math.max(50, ...history.map((h) => Math.max(h.limit, h.inFlight)));
   const chartWidth = 560;
   const chartHeight = 160;
@@ -365,7 +506,7 @@ export function FlowGateVisualizer() {
   const pointsLimit = history
     .map((h, i) => {
       const x = (i / Math.max(1, history.length - 1)) * chartWidth;
-      const y = chartHeight - (h.limit / maxChartLimit) * (chartHeight - 20) - 10;
+      const y = chartHeight - (h.limit / maxChartLimit) * (chartHeight - 30) - 15;
       return `${x},${y}`;
     })
     .join(" ");
@@ -373,7 +514,7 @@ export function FlowGateVisualizer() {
   const pointsInFlight = history
     .map((h, i) => {
       const x = (i / Math.max(1, history.length - 1)) * chartWidth;
-      const y = chartHeight - (h.inFlight / maxChartLimit) * (chartHeight - 20) - 10;
+      const y = chartHeight - (h.inFlight / maxChartLimit) * (chartHeight - 30) - 15;
       return `${x},${y}`;
     })
     .join(" ");
@@ -396,8 +537,11 @@ export function FlowGateVisualizer() {
         <div className="flex items-center gap-2 bg-[var(--chip)] p-1 rounded-full border border-[var(--line)] text-xs">
           <button
             type="button"
-            onClick={() => setMode("simulator")}
-            className={`px-3 py-1 rounded-full transition-all ${
+            onClick={() => {
+              setMode("simulator");
+              setIsRunning(false);
+            }}
+            className={`px-3 py-1 rounded-full transition-all cursor-pointer ${
               mode === "simulator"
                 ? "bg-[var(--bg)] text-[var(--fg)] font-medium shadow-xs"
                 : "text-[var(--muted)] hover:text-[var(--fg)]"
@@ -407,17 +551,68 @@ export function FlowGateVisualizer() {
           </button>
           <button
             type="button"
-            onClick={() => setMode("live")}
-            className={`px-3 py-1 rounded-full transition-all ${
+            onClick={() => {
+              setMode("live");
+              setIsRunning(false);
+            }}
+            className={`px-3 py-1 rounded-full transition-all cursor-pointer flex items-center gap-1.5 ${
               mode === "live"
                 ? "bg-[var(--bg)] text-[var(--fg)] font-medium shadow-xs"
                 : "text-[var(--muted)] hover:text-[var(--fg)]"
             }`}
           >
-            Live Gateway (localhost:8080)
+            <span>Live Gateway (localhost:8080)</span>
+            <span
+              className={`w-2 h-2 rounded-full ${
+                liveConnected ? "bg-emerald-500" : "bg-rose-500"
+              }`}
+            />
           </button>
         </div>
       </div>
+
+      {/* Live Gateway Mode Banner when disconnected */}
+      {mode === "live" && (
+        <div
+          className={`p-4 rounded-2xl border text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 ${
+            liveConnected
+              ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-700 dark:text-emerald-300"
+              : "bg-rose-500/10 border-rose-500/20 text-rose-700 dark:text-rose-300"
+          }`}
+        >
+          <div className="flex items-center gap-2.5">
+            {liveConnected ? (
+              <Wifi className="w-4 h-4 text-emerald-500 shrink-0" />
+            ) : (
+              <WifiOff className="w-4 h-4 text-rose-500 shrink-0" />
+            )}
+            <div>
+              <span className="font-semibold">
+                {liveConnected
+                  ? "Connected to Local FlowGate Gateway (127.0.0.1:8080)"
+                  : "Local Gateway Offline on 127.0.0.1:8080"}
+              </span>
+              <p className="text-[11px] opacity-80 mt-0.5">
+                {liveConnected
+                  ? "Streaming real Go atomic counters, Vegas gradient limits, and circuit breaker metrics directly from localhost."
+                  : "Start the gateway with: go run cmd/flowgate/main.go -upstream http://127.0.0.1:9090 -port 8080"}
+              </p>
+            </div>
+          </div>
+
+          {!liveConnected && (
+            <button
+              type="button"
+              onClick={() => {
+                setMode("simulator");
+              }}
+              className="px-3 py-1.5 rounded-lg bg-[var(--bg)] border border-[var(--line)] text-[var(--fg)] font-mono text-xs hover:border-[var(--fg)] shrink-0 cursor-pointer"
+            >
+              Switch to Virtual Mode
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Main Grid: Knobs + Telemetry */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -425,14 +620,26 @@ export function FlowGateVisualizer() {
         <div className="lg:col-span-5 flex flex-col gap-6">
           {/* Quick Scenario Presets */}
           <div className="p-5 rounded-2xl border border-[var(--line)] bg-[var(--bg)] flex flex-col gap-3">
-            <h3 className="text-xs uppercase tracking-wider font-semibold text-[var(--muted)]">
-              Quick Test Scenarios
-            </h3>
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs uppercase tracking-wider font-semibold text-[var(--muted)]">
+                Quick Test Scenarios
+              </h3>
+              {activePreset && (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 uppercase">
+                  Active: {activePreset}
+                </span>
+              )}
+            </div>
+
             <div className="grid grid-cols-2 gap-2 text-xs">
               <button
                 type="button"
                 onClick={() => applyPreset("normal")}
-                className="p-2.5 rounded-xl border border-[var(--line)] bg-[var(--chip)] hover:border-emerald-500/50 hover:bg-emerald-500/5 text-left flex flex-col gap-1 transition-all"
+                className={`p-2.5 rounded-xl border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  activePreset === "normal"
+                    ? "border-emerald-500 bg-emerald-500/10"
+                    : "border-[var(--line)] bg-[var(--chip)] hover:border-emerald-500/50 hover:bg-emerald-500/5"
+                }`}
               >
                 <span className="font-semibold text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
                   <CheckCircle2 className="w-3.5 h-3.5" /> 1. Benign Traffic
@@ -445,7 +652,11 @@ export function FlowGateVisualizer() {
               <button
                 type="button"
                 onClick={() => applyPreset("burst")}
-                className="p-2.5 rounded-xl border border-[var(--line)] bg-[var(--chip)] hover:border-amber-500/50 hover:bg-amber-500/5 text-left flex flex-col gap-1 transition-all"
+                className={`p-2.5 rounded-xl border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  activePreset === "burst"
+                    ? "border-amber-500 bg-amber-500/10"
+                    : "border-[var(--line)] bg-[var(--chip)] hover:border-amber-500/50 hover:bg-amber-500/5"
+                }`}
               >
                 <span className="font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
                   <Flame className="w-3.5 h-3.5" /> 2. Traffic Surge
@@ -458,7 +669,11 @@ export function FlowGateVisualizer() {
               <button
                 type="button"
                 onClick={() => applyPreset("latency")}
-                className="p-2.5 rounded-xl border border-[var(--line)] bg-[var(--chip)] hover:border-blue-500/50 hover:bg-blue-500/5 text-left flex flex-col gap-1 transition-all"
+                className={`p-2.5 rounded-xl border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  activePreset === "latency"
+                    ? "border-blue-500 bg-blue-500/10"
+                    : "border-[var(--line)] bg-[var(--chip)] hover:border-blue-500/50 hover:bg-blue-500/5"
+                }`}
               >
                 <span className="font-semibold text-blue-600 dark:text-blue-400 flex items-center gap-1.5">
                   <Gauge className="w-3.5 h-3.5" /> 3. Latency Creep
@@ -471,7 +686,11 @@ export function FlowGateVisualizer() {
               <button
                 type="button"
                 onClick={() => applyPreset("outage")}
-                className="p-2.5 rounded-xl border border-[var(--line)] bg-[var(--chip)] hover:border-rose-500/50 hover:bg-rose-500/5 text-left flex flex-col gap-1 transition-all"
+                className={`p-2.5 rounded-xl border text-left flex flex-col gap-1 transition-all cursor-pointer ${
+                  activePreset === "outage"
+                    ? "border-rose-500 bg-rose-500/10"
+                    : "border-[var(--line)] bg-[var(--chip)] hover:border-rose-500/50 hover:bg-rose-500/5"
+                }`}
               >
                 <span className="font-semibold text-rose-600 dark:text-rose-400 flex items-center gap-1.5">
                   <AlertTriangle className="w-3.5 h-3.5" /> 4. Upstream Outage
@@ -490,7 +709,7 @@ export function FlowGateVisualizer() {
                 Traffic Knobs
               </h3>
               <span className="text-xs text-[var(--faint)] font-mono">
-                {mode === "simulator" ? "Virtual Mode" : "Target: 127.0.0.1:8080"}
+                {mode === "simulator" ? "Virtual Simulator Mode" : "Target: 127.0.0.1:8080"}
               </span>
             </div>
 
@@ -510,8 +729,12 @@ export function FlowGateVisualizer() {
                 min="5"
                 max="150"
                 value={concurrency}
-                onChange={(e) => setConcurrency(Number(e.target.value))}
-                className="w-full accent-emerald-500 cursor-pointer"
+                disabled={mode === "live"}
+                onChange={(e) => {
+                  setConcurrency(Number(e.target.value));
+                  setActivePreset(null);
+                }}
+                className="w-full accent-emerald-500 cursor-pointer disabled:opacity-50"
               />
             </div>
 
@@ -532,8 +755,12 @@ export function FlowGateVisualizer() {
                 max="400"
                 step="5"
                 value={upstreamBaseRtt}
-                onChange={(e) => setUpstreamBaseRtt(Number(e.target.value))}
-                className="w-full accent-blue-500 cursor-pointer"
+                disabled={mode === "live"}
+                onChange={(e) => {
+                  setUpstreamBaseRtt(Number(e.target.value));
+                  setActivePreset(null);
+                }}
+                className="w-full accent-blue-500 cursor-pointer disabled:opacity-50"
               />
             </div>
 
@@ -554,8 +781,12 @@ export function FlowGateVisualizer() {
                 max="100"
                 step="5"
                 value={upstreamErrorRate}
-                onChange={(e) => setUpstreamErrorRate(Number(e.target.value))}
-                className="w-full accent-rose-500 cursor-pointer"
+                disabled={mode === "live"}
+                onChange={(e) => {
+                  setUpstreamErrorRate(Number(e.target.value));
+                  setActivePreset(null);
+                }}
+                className="w-full accent-rose-500 cursor-pointer disabled:opacity-50"
               />
             </div>
 
@@ -570,8 +801,9 @@ export function FlowGateVisualizer() {
                 min="5"
                 max="50"
                 value={criticalPct}
+                disabled={mode === "live"}
                 onChange={(e) => setCriticalPct(Number(e.target.value))}
-                className="w-full accent-emerald-500 cursor-pointer"
+                className="w-full accent-emerald-500 cursor-pointer disabled:opacity-50"
               />
 
               <div className="flex justify-between text-xs text-[var(--muted)] font-medium">
@@ -583,42 +815,45 @@ export function FlowGateVisualizer() {
                 min="5"
                 max="50"
                 value={bestEffortPct}
+                disabled={mode === "live"}
                 onChange={(e) => setBestEffortPct(Number(e.target.value))}
-                className="w-full accent-amber-500 cursor-pointer"
+                className="w-full accent-amber-500 cursor-pointer disabled:opacity-50"
               />
             </div>
 
-            {/* Run / Pause Controls */}
-            <div className="flex items-center gap-3 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsRunning((prev) => !prev)}
-                className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-medium text-sm transition-all shadow-xs ${
-                  isRunning
-                    ? "bg-amber-600 hover:bg-amber-700 text-white"
-                    : "bg-emerald-600 hover:bg-emerald-700 text-white"
-                }`}
-              >
-                {isRunning ? (
-                  <>
-                    <Square className="w-4 h-4 fill-current" /> Pause Traffic
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-4 h-4 fill-current" /> Start Traffic
-                  </>
-                )}
-              </button>
+            {/* Run / Pause Controls (Simulator mode) */}
+            {mode === "simulator" && (
+              <div className="flex items-center gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsRunning((prev) => !prev)}
+                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-medium text-sm transition-all shadow-xs cursor-pointer ${
+                    isRunning
+                      ? "bg-amber-600 hover:bg-amber-700 text-white"
+                      : "bg-emerald-600 hover:bg-emerald-700 text-white"
+                  }`}
+                >
+                  {isRunning ? (
+                    <>
+                      <Square className="w-4 h-4 fill-current" /> Pause Traffic
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4 fill-current" /> Start Traffic
+                    </>
+                  )}
+                </button>
 
-              <button
-                type="button"
-                onClick={resetAll}
-                className="p-2.5 rounded-xl border border-[var(--line)] text-[var(--muted)] hover:text-[var(--fg)] hover:bg-[var(--chip)] transition-colors"
-                title="Reset counters"
-              >
-                <RotateCcw className="w-4 h-4" />
-              </button>
-            </div>
+                <button
+                  type="button"
+                  onClick={resetAll}
+                  className="p-2.5 rounded-xl border border-[var(--line)] text-[var(--muted)] hover:text-[var(--fg)] hover:bg-[var(--chip)] transition-colors cursor-pointer"
+                  title="Reset counters"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -685,9 +920,9 @@ export function FlowGateVisualizer() {
             </div>
           </div>
 
-          {/* SVG Multi-Line Chart */}
+          {/* SVG Multi-Line Chart with Y-Axis Indicators */}
           <div className="p-5 rounded-2xl border border-[var(--line)] bg-[var(--bg)] flex flex-col gap-3">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-xs uppercase tracking-wider font-semibold text-[var(--muted)] flex items-center gap-2">
                 <Activity className="w-3.5 h-3.5 text-emerald-500" />
                 Adaptive Concurrency Dynamics (Live Chart)
@@ -695,48 +930,65 @@ export function FlowGateVisualizer() {
               <div className="flex items-center gap-4 text-xs font-mono">
                 <span className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400">
                   <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
-                  Estimated Limit
+                  Limit: <strong>{Math.round(limit * 10) / 10}</strong>
                 </span>
                 <span className="flex items-center gap-1.5 text-cyan-600 dark:text-cyan-400">
                   <span className="w-2.5 h-2.5 rounded-full bg-cyan-500" />
-                  In-Flight Requests
+                  In-Flight: <strong>{inFlight}</strong>
                 </span>
               </div>
             </div>
 
-            <div className="relative w-full h-40 bg-[var(--chip)] rounded-xl overflow-hidden p-2 flex items-center justify-center">
+            <div className="relative w-full h-44 bg-[var(--chip)] rounded-xl overflow-hidden p-3 flex items-center justify-center">
               {history.length > 2 ? (
-                <svg
-                  viewBox={`0 0 ${chartWidth} ${chartHeight}`}
-                  className="w-full h-full overflow-visible"
-                  preserveAspectRatio="none"
-                >
-                  <line x1="0" y1="40" x2={chartWidth} y2="40" stroke="var(--line)" strokeDasharray="4 4" />
-                  <line x1="0" y1="80" x2={chartWidth} y2="80" stroke="var(--line)" strokeDasharray="4 4" />
-                  <line x1="0" y1="120" x2={chartWidth} y2="120" stroke="var(--line)" strokeDasharray="4 4" />
+                <div className="relative w-full h-full">
+                  {/* Y-Axis Scale Guides */}
+                  <div className="absolute left-1 top-1 text-[9px] font-mono text-[var(--faint)] select-none">
+                    {Math.round(maxChartLimit)}
+                  </div>
+                  <div className="absolute left-1 top-1/2 -translate-y-1/2 text-[9px] font-mono text-[var(--faint)] select-none">
+                    {Math.round(maxChartLimit / 2)}
+                  </div>
+                  <div className="absolute left-1 bottom-1 text-[9px] font-mono text-[var(--faint)] select-none">
+                    0
+                  </div>
 
-                  <polyline
-                    fill="none"
-                    stroke="#10b981"
-                    strokeWidth="2.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    points={pointsLimit}
-                  />
+                  <svg
+                    viewBox={`0 0 ${chartWidth} ${chartHeight}`}
+                    className="w-full h-full pl-6 overflow-visible"
+                    preserveAspectRatio="none"
+                  >
+                    <line x1="0" y1="20" x2={chartWidth} y2="20" stroke="var(--line)" strokeDasharray="3 3" opacity="0.6" />
+                    <line x1="0" y1="80" x2={chartWidth} y2="80" stroke="var(--line)" strokeDasharray="3 3" opacity="0.6" />
+                    <line x1="0" y1="140" x2={chartWidth} y2="140" stroke="var(--line)" strokeDasharray="3 3" opacity="0.6" />
 
-                  <polyline
-                    fill="none"
-                    stroke="#06b6d4"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    points={pointsInFlight}
-                  />
-                </svg>
+                    {/* Limit Curve */}
+                    <polyline
+                      fill="none"
+                      stroke="#10b981"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      points={pointsLimit}
+                    />
+
+                    {/* In-Flight Curve */}
+                    <polyline
+                      fill="none"
+                      stroke="#06b6d4"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      points={pointsInFlight}
+                    />
+                  </svg>
+                </div>
               ) : (
                 <div className="text-xs text-[var(--muted)] flex items-center gap-2">
-                  <Activity className="w-4 h-4 animate-spin" />
-                  Awaiting traffic telemetry... Click &quot;Start Traffic&quot; to begin.
+                  <Activity className="w-4 h-4 animate-spin text-emerald-500" />
+                  {mode === "simulator"
+                    ? 'Awaiting telemetry... Click "Start Traffic" above to begin.'
+                    : "Connecting to 127.0.0.1:8080 metrics endpoint..."}
                 </div>
               )}
             </div>
@@ -790,7 +1042,7 @@ export function FlowGateVisualizer() {
                     breakerTripTimeRef.current = Date.now();
                     setBreakerCooldown(5);
                   }}
-                  className="flex-1 text-[11px] py-1.5 px-2 rounded-lg bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors font-medium text-center"
+                  className="flex-1 text-[11px] py-1.5 px-2 rounded-lg bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 transition-colors font-medium text-center cursor-pointer"
                 >
                   Manual Trip
                 </button>
@@ -802,7 +1054,7 @@ export function FlowGateVisualizer() {
                     stateRef.current.breakerState = "CLOSED";
                     stateRef.current.breakerFailures = 0;
                   }}
-                  className="flex-1 text-[11px] py-1.5 px-2 rounded-lg bg-[var(--chip)] text-[var(--fg)] hover:bg-[var(--chip-hover)] transition-colors font-medium text-center"
+                  className="flex-1 text-[11px] py-1.5 px-2 rounded-lg bg-[var(--chip)] text-[var(--fg)] hover:bg-[var(--chip-hover)] transition-colors font-medium text-center cursor-pointer"
                 >
                   Reset
                 </button>
@@ -827,7 +1079,7 @@ export function FlowGateVisualizer() {
                   </div>
                   <div className="w-full bg-[var(--chip)] h-1.5 rounded-full overflow-hidden">
                     <div
-                      className="bg-emerald-500 h-full"
+                      className="bg-emerald-500 h-full transition-all duration-200"
                       style={{
                         width: `${
                           stats.criticalAdmitted + stats.criticalShed > 0
@@ -852,7 +1104,7 @@ export function FlowGateVisualizer() {
                   </div>
                   <div className="w-full bg-[var(--chip)] h-1.5 rounded-full overflow-hidden">
                     <div
-                      className="bg-blue-500 h-full"
+                      className="bg-blue-500 h-full transition-all duration-200"
                       style={{
                         width: `${
                           stats.standardAdmitted + stats.standardShed > 0
@@ -877,7 +1129,7 @@ export function FlowGateVisualizer() {
                   </div>
                   <div className="w-full bg-[var(--chip)] h-1.5 rounded-full overflow-hidden">
                     <div
-                      className="bg-amber-500 h-full"
+                      className="bg-amber-500 h-full transition-all duration-200"
                       style={{
                         width: `${
                           stats.bestEffortAdmitted + stats.bestEffortShed > 0
@@ -908,7 +1160,7 @@ export function FlowGateVisualizer() {
               <button
                 type="button"
                 onClick={() => setLogs([])}
-                className="text-[11px] font-mono px-2 py-0.5 rounded border border-[var(--line)] bg-[var(--chip)] text-[var(--muted)] hover:text-rose-500 hover:bg-[var(--chip-hover)] transition-colors"
+                className="text-[11px] font-mono px-2 py-0.5 rounded border border-[var(--line)] bg-[var(--chip)] text-[var(--muted)] hover:text-rose-500 hover:bg-[var(--chip-hover)] transition-colors cursor-pointer"
               >
                 Clear
               </button>
@@ -931,30 +1183,16 @@ export function FlowGateVisualizer() {
           </div>
         </div>
 
-        <div
-          ref={logContainerRef}
-          style={{ overflowAnchor: "none" }}
-          onWheel={(e) => {
-            window.scrollBy({ top: e.deltaY, behavior: "auto" });
-          }}
-          onTouchStart={(e) => {
-            touchStartY.current = e.touches[0].clientY;
-          }}
-          onTouchMove={(e) => {
-            if (touchStartY.current === null) return;
-            const currentY = e.touches[0].clientY;
-            const deltaY = touchStartY.current - currentY;
-            window.scrollBy({ top: deltaY, behavior: "auto" });
-            touchStartY.current = currentY;
-          }}
-          onTouchEnd={() => {
-            touchStartY.current = null;
-          }}
-          className="font-mono text-xs max-h-60 overflow-y-auto overflow-x-hidden divide-y divide-[var(--line)] border border-[var(--line)] rounded-xl bg-[var(--chip)] overscroll-y-auto"
-        >
+        {/* Scrollable logs with standard overscroll containment */}
+        <div className="font-mono text-xs max-h-64 overflow-y-auto overflow-x-hidden divide-y divide-[var(--line)] border border-[var(--line)] rounded-xl bg-[var(--chip)] overscroll-contain">
           {logs.length === 0 ? (
-            <div className="p-4 text-center text-[var(--muted)]">
-              No requests recorded yet. Click &quot;Start Traffic&quot; above to watch real-time gateway decisions.
+            <div className="p-6 text-center text-[var(--muted)] flex flex-col items-center gap-2">
+              <Terminal className="w-5 h-5 opacity-40" />
+              <span>
+                {mode === "simulator"
+                  ? 'No requests recorded yet. Click "Start Traffic" above or choose a scenario preset to begin.'
+                  : "Waiting for requests on http://127.0.0.1:8080..."}
+              </span>
             </div>
           ) : (
             logs.map((log) => (
