@@ -72,6 +72,14 @@ export function FlowGateVisualizer() {
   // History for charts
   const [history, setHistory] = useState<TelemetryPoint[]>([]);
   const [logs, setLogs] = useState<RequestLog[]>([]);
+  const [isStreamPaused, setIsStreamPaused] = useState<boolean>(false);
+  const isStreamPausedRef = useRef<boolean>(false);
+  const logContainerRef = useRef<HTMLDivElement>(null);
+  const touchStartY = useRef<number | null>(null);
+
+  useEffect(() => {
+    isStreamPausedRef.current = isStreamPaused;
+  }, [isStreamPaused]);
 
   // Simulation animation frame ref
   const animRef = useRef<number | null>(null);
@@ -169,6 +177,8 @@ export function FlowGateVisualizer() {
     }
 
     let lastTime = Date.now();
+    let lastLogFlush = Date.now();
+    const pendingLogs: RequestLog[] = [];
 
     const tick = () => {
       const now = Date.now();
@@ -344,7 +354,19 @@ export function FlowGateVisualizer() {
       });
 
       if (batchLogs.length > 0) {
-        setLogs((prev) => [...batchLogs, ...prev].slice(0, 50));
+        pendingLogs.push(...batchLogs);
+      }
+
+      // Flush to UI at a readable, smooth cadence (every 200ms) without locking scroll
+      if (now - lastLogFlush >= 200) {
+        lastLogFlush = now;
+        if (!isStreamPausedRef.current && pendingLogs.length > 0) {
+          // Take up to 4 newest logs to present readable pacing
+          const toFlush = pendingLogs.splice(0, pendingLogs.length).slice(-4);
+          setLogs((prev) => [...toFlush.reverse(), ...prev].slice(0, 50));
+        } else if (pendingLogs.length > 100) {
+          pendingLogs.splice(0, pendingLogs.length - 50);
+        }
       }
 
       animRef.current = requestAnimationFrame(tick);
@@ -897,10 +919,44 @@ export function FlowGateVisualizer() {
       {/* Real-Time Request Inspector Log */}
       <div className="p-4 sm:p-5 rounded-2xl border border-[var(--line)] bg-[var(--bg)] flex flex-col gap-3">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 border-b border-[var(--line)] pb-3">
-          <h3 className="text-xs uppercase tracking-wider font-semibold text-[var(--muted)] flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-            Live Request Stream (Gateway Decisions)
-          </h3>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h3 className="text-xs uppercase tracking-wider font-semibold text-[var(--muted)] flex items-center gap-2">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isStreamPaused ? "bg-amber-500" : "bg-emerald-500 animate-pulse"
+                }`}
+              />
+              Live Request Stream (Gateway Decisions)
+            </h3>
+            <button
+              type="button"
+              onClick={() => setIsStreamPaused((prev) => !prev)}
+              className="text-[11px] font-mono px-2 py-0.5 rounded border border-[var(--line)] bg-[var(--chip)] text-[var(--fg2)] hover:bg-[var(--chip-hover)] transition-colors flex items-center gap-1"
+              title={isStreamPaused ? "Resume live streaming" : "Pause live streaming to inspect logs"}
+            >
+              {isStreamPaused ? (
+                <>
+                  <Play className="w-2.5 h-2.5 text-emerald-500 fill-emerald-500" />
+                  <span>Resume Stream</span>
+                </>
+              ) : (
+                <>
+                  <Square className="w-2.5 h-2.5 text-amber-500 fill-amber-500" />
+                  <span>Pause Stream</span>
+                </>
+              )}
+            </button>
+            {logs.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setLogs([])}
+                className="text-[11px] font-mono px-2 py-0.5 rounded border border-[var(--line)] bg-[var(--chip)] text-[var(--muted)] hover:text-rose-500 hover:bg-[var(--chip-hover)] transition-colors"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+
           <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
             <span className="px-2 py-0.5 rounded bg-[var(--chip)] text-[var(--fg2)] border border-[var(--line)]">
               Total: <strong className="text-[var(--fg)]">{stats.total}</strong>
@@ -917,7 +973,42 @@ export function FlowGateVisualizer() {
           </div>
         </div>
 
-        <div className="font-mono text-xs max-h-60 overflow-y-auto overflow-x-hidden divide-y divide-[var(--line)] border border-[var(--line)] rounded-xl bg-[var(--chip)]">
+        <div
+          ref={logContainerRef}
+          style={{ overflowAnchor: "none" }}
+          onWheel={(e) => {
+            const el = logContainerRef.current;
+            if (!el) return;
+            // When user scrolls up and is at or near the top of the container
+            if (e.deltaY < 0 && el.scrollTop <= 2) {
+              window.scrollBy({ top: e.deltaY, behavior: "auto" });
+            }
+            // When user scrolls down and is at or near the bottom of the container
+            else if (e.deltaY > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 2) {
+              window.scrollBy({ top: e.deltaY, behavior: "auto" });
+            }
+          }}
+          onTouchStart={(e) => {
+            touchStartY.current = e.touches[0].clientY;
+          }}
+          onTouchMove={(e) => {
+            const el = logContainerRef.current;
+            if (!el || touchStartY.current === null) return;
+            const currentY = e.touches[0].clientY;
+            const deltaY = touchStartY.current - currentY; // positive = down/swipe down, negative = up/swipe up
+
+            if (deltaY < 0 && el.scrollTop <= 2) {
+              window.scrollBy({ top: deltaY, behavior: "auto" });
+            } else if (deltaY > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - 2) {
+              window.scrollBy({ top: deltaY, behavior: "auto" });
+            }
+            touchStartY.current = currentY;
+          }}
+          onTouchEnd={() => {
+            touchStartY.current = null;
+          }}
+          className="font-mono text-xs max-h-60 overflow-y-auto overflow-x-hidden divide-y divide-[var(--line)] border border-[var(--line)] rounded-xl bg-[var(--chip)] overscroll-y-auto"
+        >
           {logs.length === 0 ? (
             <div className="p-4 text-center text-[var(--muted)]">
               No requests recorded yet. Click &quot;Start Traffic&quot; above to watch real-time gateway decisions.
