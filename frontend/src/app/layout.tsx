@@ -109,6 +109,9 @@ export const metadata: Metadata = {
     ],
   },
   manifest: "/manifest.webmanifest",
+  verification: {
+    google: "lNuzyRSsZ_5XTzmW6t_6NkTfni4W3zTrHFHNrjLTvNM",
+  },
 };
 
 export default function RootLayout({
@@ -119,6 +122,10 @@ export default function RootLayout({
   return (
     <html lang="en" className="theme" suppressHydrationWarning>
       <head>
+        <meta
+          name="google-site-verification"
+          content="lNuzyRSsZ_5XTzmW6t_6NkTfni4W3zTrHFHNrjLTvNM"
+        />
         <FlowGateJsonLd />
         <script
           dangerouslySetInnerHTML={{
